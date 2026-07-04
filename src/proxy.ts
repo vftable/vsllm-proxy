@@ -7,6 +7,7 @@ import type {
   ProxyServer,
   RouteResult,
   AttemptResult,
+  KeyState,
   CreateProxyOpts,
 } from "./types.js";
 import { resolveConfig, resolvePort } from "./config.js";
@@ -41,10 +42,74 @@ function flattenHeaders(
   return out;
 }
 
+function maskKey(key: string): string {
+  if (!key) return "(none)";
+  if (key.length <= 12) return `${key.slice(0, 3)}...${key.slice(-4)}`;
+  return `${key.slice(0, 8)}...${key.slice(-4)}`;
+}
+
+function prettyBody(body: Buffer | string | null): string {
+  if (!body) return "(empty)";
+  const str = typeof body === "string" ? body : body.toString("utf8");
+  const trimmed = str.trim();
+  if (!trimmed) return "(empty)";
+
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    try {
+      return JSON.stringify(JSON.parse(trimmed), null, 2).slice(0, 8192);
+    } catch {}
+  }
+
+  if (trimmed.includes("data: ")) {
+    return trimmed
+      .split("\n")
+      .map((line) => {
+        if (!line.startsWith("data: ")) return line;
+        const data = line.slice(6).trim();
+        if (!data || data === "[DONE]") return `data: ${data}`;
+        try {
+          return `data: ${JSON.stringify(JSON.parse(data), null, 2)}`;
+        } catch {
+          return line;
+        }
+      })
+      .join("\n")
+      .slice(0, 8192);
+  }
+
+  return str.slice(0, 4096);
+}
+
+function parseRateLimit(
+  status: number,
+  resHeaders: Record<string, string>,
+): number {
+  if (status !== 429) return 0;
+
+  const rams = resHeaders["retry-after-ms"];
+  if (rams) {
+    const ms = parseInt(rams, 10);
+    if (!isNaN(ms) && ms > 0) return ms;
+  }
+
+  const ra = resHeaders["retry-after"];
+  if (ra) {
+    const secs = parseFloat(ra);
+    if (!isNaN(secs)) return Math.max(1000, secs * 1000);
+    const date = new Date(ra);
+    if (!isNaN(date.getTime())) {
+      return Math.max(1000, date.getTime() - Date.now());
+    }
+  }
+
+  return 60_000;
+}
+
 function logFailure(
   tag: string,
   method: string | undefined,
   path: string,
+  keyId: string,
   clientHeaders: Record<string, string>,
   upstreamHeaders: Record<string, string>,
   reqBody: Buffer | null,
@@ -53,29 +118,15 @@ function logFailure(
   resStatus: number | null,
   reason: string,
 ): void {
-  const clientHeadersStr = JSON.stringify(clientHeaders, null, 2);
-  const upstreamHeadersStr = JSON.stringify(upstreamHeaders, null, 2);
-  const reqBodyStr =
-    reqBody && reqBody.length
-      ? reqBody.toString("utf8").slice(0, 4096)
-      : "(empty)";
-  const resHeadersStr = resHeaders
-    ? JSON.stringify(resHeaders, null, 2)
-    : "(no response)";
-  const resBodyStr =
-    resBody && resBody.length
-      ? resBody.toString("utf8").slice(0, 4096)
-      : "(empty)";
-
   console.error(
-    `[vsllm-proxy] ${tag} FAILURE ${method ?? "?"} ${path}\n` +
+    `[vsllm-proxy] ${tag} FAILURE ${method ?? "?"} ${path} key=${keyId}\n` +
       `  reason: ${reason}\n` +
       `  status: ${resStatus ?? "N/A"}\n` +
-      `  client request headers:\n  ${clientHeadersStr}\n` +
-      `  upstream request headers:\n  ${upstreamHeadersStr}\n` +
-      `  request body:\n  ${reqBodyStr}\n` +
-      `  response headers:\n  ${resHeadersStr}\n` +
-      `  response body:\n  ${resBodyStr}`,
+      `  client request headers:\n  ${JSON.stringify(clientHeaders, null, 2)}\n` +
+      `  upstream request headers:\n  ${JSON.stringify(upstreamHeaders, null, 2)}\n` +
+      `  request body:\n  ${prettyBody(reqBody)}\n` +
+      `  response headers:\n  ${resHeaders ? JSON.stringify(resHeaders, null, 2) : "(no response)"}\n` +
+      `  response body:\n  ${prettyBody(resBody)}`,
   );
 }
 
@@ -104,6 +155,7 @@ function captureAndLogFailure(
   tag: string,
   method: string | undefined,
   path: string,
+  keyId: string,
   clientHeaders: Record<string, string>,
   upstreamHeaders: Record<string, string>,
   reqBody: Buffer | null,
@@ -118,6 +170,7 @@ function captureAndLogFailure(
         tag,
         method,
         path,
+        keyId,
         clientHeaders,
         upstreamHeaders,
         reqBody,
@@ -133,6 +186,7 @@ function captureAndLogFailure(
         tag,
         method,
         path,
+        keyId,
         clientHeaders,
         upstreamHeaders,
         reqBody,
@@ -231,7 +285,6 @@ export function isStreamError(body: string): string | null {
 
 export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
   const config = resolveConfig(opts);
-
   const upstreamKeys: string[] = Array.isArray(config.upstreamApiKey)
     ? config.upstreamApiKey.filter(
         (k): k is string => typeof k === "string" && k.length > 0,
@@ -240,7 +293,12 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
         config.upstreamApiKey.length > 0
       ? [config.upstreamApiKey]
       : [];
-  let nextStartKeyIndex = 0;
+
+  const keyStates: KeyState[] = upstreamKeys.map((k) => ({
+    key: k,
+    keyId: maskKey(k),
+    rateLimitedUntil: 0,
+  }));
 
   const upstreamAgent = config.upstreamBaseUrl.startsWith("https:")
     ? new https.Agent({
@@ -254,28 +312,64 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
         maxFreeSockets: 32,
       });
 
-  function claimStartKey(): number {
-    if (upstreamKeys.length === 0) return 0;
-    const idx = nextStartKeyIndex;
-    nextStartKeyIndex = (nextStartKeyIndex + 1) % upstreamKeys.length;
-    return idx;
+  function selectKey(tried: Set<number>): number {
+    if (keyStates.length === 0) return 0;
+    const now = Date.now();
+
+    const available = keyStates
+      .map((_, i) => i)
+      .filter((i) => !tried.has(i) && keyStates[i].rateLimitedUntil <= now);
+
+    if (available.length === 1) return available[0];
+    if (available.length > 1) {
+      return available[Math.floor(Math.random() * available.length)];
+    }
+
+    const untried = keyStates.map((_, i) => i).filter((i) => !tried.has(i));
+    if (untried.length > 0) {
+      return untried.reduce((best, i) =>
+        keyStates[i].rateLimitedUntil < keyStates[best].rateLimitedUntil
+          ? i
+          : best,
+      );
+    }
+
+    return Math.floor(Math.random() * keyStates.length);
+  }
+
+  function availableKeyIds(exclude?: number): string[] {
+    const now = Date.now();
+    return keyStates
+      .map((k, i) => ({ k, i }))
+      .filter(({ k, i }) => i !== exclude && k.rateLimitedUntil <= now)
+      .map(({ k }) => k.keyId);
   }
 
   function resolveAuth(
     req: IncomingMessage,
-    keyOffset: number,
-  ): { auth: string | null; rawKey: string | null } {
-    if (upstreamKeys.length > 0) {
-      const key = upstreamKeys[keyOffset % upstreamKeys.length];
-      return { auth: `Bearer ${key}`, rawKey: key };
+    keyIndex: number,
+  ): { auth: string | null; rawKey: string | null; keyId: string } {
+    if (keyStates.length > 0) {
+      const entry = keyStates[keyIndex % keyStates.length];
+      return {
+        auth: `Bearer ${entry.key}`,
+        rawKey: entry.key,
+        keyId: entry.keyId,
+      };
     }
     const hdr = req.headers["authorization"];
     if (hdr) {
       const rawKey =
-        typeof hdr === "string" ? hdr.replace(/^Bearer\s+/i, "").trim() : null;
-      return { auth: hdr, rawKey };
+        typeof hdr === "string"
+          ? hdr.replace(/^Bearer\s+/i, "").trim()
+          : null;
+      return {
+        auth: hdr,
+        rawKey,
+        keyId: rawKey ? maskKey(rawKey) : "(caller)",
+      };
     }
-    return { auth: null, rawKey: null };
+    return { auth: null, rawKey: null, keyId: "(none)" };
   }
 
   function buildUpstreamHeaders(
@@ -309,11 +403,11 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
     res: ServerResponse,
     upstreamPath: string,
     body: Buffer | null,
-    keyOffset: number,
+    keyIndex: number,
     sessionId: string | null,
   ): Promise<AttemptResult> {
     const upstream = new URL(upstreamPath, config.upstreamBaseUrl);
-    const { auth, rawKey } = resolveAuth(req, keyOffset);
+    const { auth, rawKey, keyId } = resolveAuth(req, keyIndex);
     if (!auth) {
       respond(res, 401, {
         error: {
@@ -334,6 +428,10 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
     );
     const transport = upstream.protocol === "https:" ? https : http;
     const reqMethod = req.method ?? "?";
+
+    console.log(
+      `[vsllm-proxy] outbound key=${keyId} ${reqMethod} ${upstreamPath}`,
+    );
 
     return new Promise((resolve) => {
       let connectionTimer: ReturnType<typeof setTimeout> | null = null;
@@ -359,10 +457,18 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
           const capturedHeaders = flattenHeaders(upRes.headers);
 
           if (RETRY_STATUS.has(status)) {
+            const rateLimitMs = parseRateLimit(status, capturedHeaders);
+            console.warn(
+              `[vsllm-proxy] fail key=${keyId} status=${status} ${reqMethod} ${upstreamPath}` +
+                (rateLimitMs > 0
+                  ? ` retry_after=${Math.ceil(rateLimitMs / 1000)}s`
+                  : ""),
+            );
             captureAndLogFailure(
               "retry",
               reqMethod,
               upstreamPath,
+              keyId,
               clientHeaders,
               outHeaders,
               body,
@@ -371,7 +477,12 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
               status,
               `status ${status}`,
             ).then(() =>
-              resolve({ ok: false, status, reason: `status ${status}` }),
+              resolve({
+                ok: false,
+                status,
+                reason: `status ${status}`,
+                rateLimitMs,
+              }),
             );
             return;
           }
@@ -380,10 +491,14 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
           // forward the buffered body to the client. Error bodies are small, so
           // buffering them is preferable to losing them in a streamed pipe.
           if (status < 200 || status >= 300) {
+            console.warn(
+              `[vsllm-proxy] fail key=${keyId} status=${status} ${reqMethod} ${upstreamPath}`,
+            );
             captureAndLogFailure(
               "upstream",
               reqMethod,
               upstreamPath,
+              keyId,
               clientHeaders,
               outHeaders,
               body,
@@ -438,9 +553,13 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
 
           const chunks: Buffer[] = [];
           let streaming = false;
+          const streamStartTime = Date.now();
 
           const beginStream = () => {
             streaming = true;
+            console.log(
+              `[vsllm-proxy] stream-start key=${keyId} ${reqMethod} ${upstreamPath}`,
+            );
             res.writeHead(status, fwdHeaders);
             const buffered = Buffer.concat(chunks);
             if (buffered.length) {
@@ -482,12 +601,26 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
                 res.end();
               } catch {}
             }
+            if (streaming) {
+              const elapsed = (
+                (Date.now() - streamStartTime) / 1000
+              ).toFixed(1);
+              console.warn(
+                `[vsllm-proxy] stream-error key=${keyId} ${reqMethod} ${upstreamPath} (${elapsed}s)`,
+              );
+            }
             resolve({ ok: true, committed: true });
           });
 
           upRes.on("end", () => {
             if (streaming) {
               res.end();
+              const elapsed = (
+                (Date.now() - streamStartTime) / 1000
+              ).toFixed(1);
+              console.log(
+                `[vsllm-proxy] stream-end key=${keyId} ${reqMethod} ${upstreamPath} (${elapsed}s)`,
+              );
               resolve({ ok: true, committed: true });
               return;
             }
@@ -496,6 +629,9 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
             const errReason = isStreamError(resBody.toString("utf8"));
 
             if (errReason) {
+              console.warn(
+                `[vsllm-proxy] fail key=${keyId} stream-error ${reqMethod} ${upstreamPath} (${errReason})`,
+              );
               resolve({ ok: false, reason: `stream error: ${errReason}` });
               return;
             }
@@ -517,10 +653,14 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
           clearTimeout(connectionTimer);
           connectionTimer = null;
         }
+        console.warn(
+          `[vsllm-proxy] fail key=${keyId} error ${reqMethod} ${upstreamPath} (${err.message})`,
+        );
         logFailure(
           "error",
           reqMethod,
           upstreamPath,
+          keyId,
           flattenHeaders(req.headers),
           outHeaders,
           body,
@@ -544,30 +684,49 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
     body: Buffer | null,
     sessionId: string | null,
   ): Promise<void> {
-    const startKey = claimStartKey();
+    const tried = new Set<number>();
     let lastReason = "no attempts";
-    for (
-      let attempt = 1, keyOffset = startKey;
-      attempt <= config.retryAttempts;
-      attempt++, keyOffset++
-    ) {
+    const maxAttempts =
+      keyStates.length > 0
+        ? Math.max(config.retryAttempts, keyStates.length)
+        : config.retryAttempts;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       if (res.writableEnded || res.headersSent) return;
+
+      const keyIndex = selectKey(tried);
+      tried.add(keyIndex);
+
       const result = await attemptOnce(
         req,
         res,
         upstreamPath,
         body,
-        keyOffset,
+        keyIndex,
         sessionId,
       );
       if (result.ok) return;
 
       lastReason = result.reason || lastReason;
-      const more = attempt < config.retryAttempts;
+
+      if (result.rateLimitMs && result.rateLimitMs > 0 && keyStates.length > 0) {
+        keyStates[keyIndex].rateLimitedUntil =
+          Date.now() + result.rateLimitMs;
+        const avail = availableKeyIds(keyIndex);
+        console.warn(
+          `[vsllm-proxy] rate-limited key=${keyStates[keyIndex].keyId} ` +
+            `cooldown=${Math.ceil(result.rateLimitMs / 1000)}s` +
+            (avail.length > 0
+              ? ` available=${avail.join(",")}`
+              : " (no other keys available)"),
+        );
+      }
+
+      const more = attempt < maxAttempts;
       console.warn(
-        `[vsllm-proxy] upstream attempt ${attempt}/${config.retryAttempts} failed (${lastReason})` +
+        `[vsllm-proxy] retry ${attempt}/${maxAttempts} (${lastReason})` +
           (more
-            ? ` — retrying in ${config.retryIntervalMs}ms`
+            ? ` — trying next key in ${config.retryIntervalMs}ms`
             : " — giving up"),
       );
       if (more) await sleep(config.retryIntervalMs);

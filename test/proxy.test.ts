@@ -444,7 +444,7 @@ test("e2e: caller Authorization is used as fallback when no upstreamApiKey", asy
   }
 });
 
-test("e2e: upstreamApiKey array rotates round-robin across requests", async () => {
+test("e2e: upstreamApiKey array uses all keys across requests", async () => {
   const seen: string[] = [];
   const { proxy, upstream } = await boot(
     {
@@ -459,20 +459,17 @@ test("e2e: upstreamApiKey array rotates round-robin across requests", async () =
 
   try {
     const port = (proxy.address() as { port: number }).port;
-    for (let i = 0; i < 6; i++) {
+    for (let i = 0; i < 30; i++) {
       await proxyRequest(port, {
         path: "/v1/chat/completions",
         body: { model: "gpt-4o", messages: [{ role: "user", content: "hi" }] },
       });
     }
-    assert.deepEqual(seen, [
-      "Bearer key-a",
-      "Bearer key-b",
-      "Bearer key-c",
-      "Bearer key-a",
-      "Bearer key-b",
-      "Bearer key-c",
-    ]);
+    const seenSet = new Set(seen);
+    assert.ok(seenSet.has("Bearer key-a"), "key-a should be used");
+    assert.ok(seenSet.has("Bearer key-b"), "key-b should be used");
+    assert.ok(seenSet.has("Bearer key-c"), "key-c should be used");
+    assert.equal(seen.length, 30);
   } finally {
     await close(proxy);
     await close(upstream);
@@ -488,7 +485,7 @@ test("e2e: keys rotate across retries within a single request", async () => {
         hits++;
         seen.push(req.headers["authorization"] ?? "");
         if (hits < 3) {
-          res.writeHead(429, { "content-type": "application/json" });
+          res.writeHead(500, { "content-type": "application/json" });
           res.end(JSON.stringify({ error: "temp" }));
           return;
         }
@@ -507,24 +504,27 @@ test("e2e: keys rotate across retries within a single request", async () => {
     });
     assert.equal(out.status, 200);
     assert.equal(hits, 3);
-    assert.deepEqual(seen, ["Bearer key-a", "Bearer key-b", "Bearer key-c"]);
+    // Three different keys should have been used (order is random)
+    assert.equal(new Set(seen).size, 3, "expected 3 distinct keys, got: " + seen.join(", "));
   } finally {
     await close(proxy);
     await close(upstream);
   }
 });
 
-test("e2e: next request resumes rotation after the previous request's retries", async () => {
+test("e2e: rate-limited keys are skipped on subsequent requests", async () => {
   const seen: string[] = [];
-  let hits = 0;
   const { proxy, upstream } = await boot(
     {
       upstreamHandler: (req, res) => {
-        hits++;
-        seen.push(req.headers["authorization"] ?? "");
-        if (hits <= 2) {
-          res.writeHead(429, { "content-type": "application/json" });
-          res.end(JSON.stringify({ error: "temp" }));
+        const auth = req.headers["authorization"] ?? "";
+        seen.push(auth);
+        if (auth === "Bearer key-a") {
+          res.writeHead(429, {
+            "content-type": "application/json",
+            "retry-after": "120",
+          });
+          res.end(JSON.stringify({ error: "rate limited" }));
           return;
         }
         res.writeHead(200, { "content-type": "application/json" });
@@ -536,20 +536,22 @@ test("e2e: next request resumes rotation after the previous request's retries", 
 
   try {
     const port = (proxy.address() as { port: number }).port;
+    // First request: might hit key-a first (rate-limited) then succeed with another key
     await proxyRequest(port, {
       path: "/v1/chat/completions",
       body: { model: "gpt-4o", messages: [{ role: "user", content: "hi" }] },
     });
+    seen.length = 0;
+    // Second request: key-a should be rate-limited and skipped
     await proxyRequest(port, {
       path: "/v1/chat/completions",
       body: { model: "gpt-4o", messages: [{ role: "user", content: "hi" }] },
     });
-    assert.deepEqual(seen, [
-      "Bearer key-a",
-      "Bearer key-b",
-      "Bearer key-c",
-      "Bearer key-b",
-    ]);
+    // key-a should NOT appear in the second request's attempts
+    assert.ok(
+      !seen.includes("Bearer key-a"),
+      "rate-limited key-a should not be used: " + seen.join(", "),
+    );
   } finally {
     await close(proxy);
     await close(upstream);

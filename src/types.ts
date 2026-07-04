@@ -22,6 +22,13 @@ export interface AttemptResult {
   committed?: boolean;
   status?: number;
   reason?: string;
+  rateLimitMs?: number;
+}
+
+export interface KeyState {
+  key: string;
+  keyId: string;
+  rateLimitedUntil: number;
 }
 
 export interface UpstreamErrorResponse {
