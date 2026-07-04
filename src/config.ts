@@ -7,7 +7,7 @@ import type { ProxyConfig, CreateProxyOpts } from "./types.js";
 const CLAUDE_CODE_BETA_FLAGS = [
   "claude-code-20250219",
   "interleaved-thinking-2025-05-14",
-  "redact-thinking-2026-02-12",
+  // "redact-thinking-2026-02-12",
   "thinking-token-count-2026-05-13",
   "context-management-2025-06-27",
   "prompt-caching-scope-2026-01-05",
