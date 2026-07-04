@@ -280,7 +280,7 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
     }
     out["host"] = config.upstreamHost;
     if (auth) out["authorization"] = auth;
-    if (rawKey) out["x-api-key"] = rawKey;
+    delete out["x-api-key"];
     if (bodyLen > 0) out["content-length"] = String(bodyLen);
     if (!out["accept"]) out["accept"] = "application/json";
     if (config.upstreamHeaders) {
