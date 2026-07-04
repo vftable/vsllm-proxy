@@ -242,6 +242,18 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
       : [];
   let nextStartKeyIndex = 0;
 
+  const upstreamAgent = config.upstreamBaseUrl.startsWith("https:")
+    ? new https.Agent({
+        keepAlive: true,
+        maxSockets: 256,
+        maxFreeSockets: 32,
+      })
+    : new http.Agent({
+        keepAlive: true,
+        maxSockets: 256,
+        maxFreeSockets: 32,
+      });
+
   function claimStartKey(): number {
     if (upstreamKeys.length === 0) return 0;
     const idx = nextStartKeyIndex;
@@ -334,6 +346,7 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
           method: reqMethod,
           path: `${upstream.pathname}${upstream.search}`,
           headers: outHeaders,
+          agent: upstreamAgent,
         },
         (upRes) => {
           if (connectionTimer) {
@@ -617,7 +630,9 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
   const server = http.createServer(handler) as ProxyServer;
   server.config = config;
   server.timeout = 0;
-  server.keepAliveTimeout = 0;
+  server.keepAliveTimeout = 120_000;
+  server.requestTimeout = 0;
+  server.headersTimeout = 130_000;
   return server;
 }
 
