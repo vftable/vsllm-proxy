@@ -50,7 +50,10 @@ function maskKey(key: string): string {
 
 function prettyBody(body: Buffer | string | null): string {
   if (!body) return "(empty)";
-  const str = typeof body === "string" ? body : body.toString("utf8");
+  const raw = typeof body === "string" ? Buffer.from(body, "utf8") : body;
+  if (!raw.length) return "(empty)";
+
+  const str = raw.toString("utf8");
   const trimmed = str.trim();
   if (!trimmed) return "(empty)";
 
@@ -75,6 +78,15 @@ function prettyBody(body: Buffer | string | null): string {
       })
       .join("\n")
       .slice(0, 8192);
+  }
+
+  let nonPrintable = 0;
+  for (let i = 0; i < trimmed.length && i < 512; i++) {
+    const code = trimmed.charCodeAt(i);
+    if (code < 32 && code !== 9 && code !== 10 && code !== 13) nonPrintable++;
+  }
+  if (nonPrintable > 4) {
+    return `(binary/compressed data, ${raw.length} bytes)`;
   }
 
   return str.slice(0, 4096);
@@ -387,6 +399,7 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
     out["host"] = config.upstreamHost;
     if (auth) out["authorization"] = auth;
     delete out["x-api-key"];
+    delete out["accept-encoding"];
     if (bodyLen > 0) out["content-length"] = String(bodyLen);
     if (!out["accept"]) out["accept"] = "application/json";
     if (config.upstreamHeaders) {
