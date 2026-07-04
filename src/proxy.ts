@@ -410,15 +410,72 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
             return;
           }
 
-          // 2xx: buffer the response, check for stream errors, then forward.
+          // 2xx: forward the response to the client. For SSE streams we peek at
+          // the first event(s) to check for a stream-level error, then flush
+          // the buffer and pipe the rest directly so the client receives data
+          // in real time. For non-SSE responses we buffer fully (same as
+          // before) since there is no streaming benefit.
           if (res.headersSent || res.writableEnded) {
             upRes.resume();
             resolve({ ok: true, committed: true });
             return;
           }
 
+          const fwdHeaders: Record<string, string | string[]> = {};
+          for (const [k, v] of Object.entries(upRes.headers)) {
+            if (v === undefined) continue;
+            const lk = k.toLowerCase();
+            if (lk === "content-length" || lk === "transfer-encoding") {
+              continue;
+            }
+            fwdHeaders[k] = v;
+          }
+
+          const contentType = String(
+            upRes.headers["content-type"] || "",
+          ).toLowerCase();
+          const isSSE = contentType.includes("text/event-stream");
+
           const chunks: Buffer[] = [];
-          upRes.on("data", (c: Buffer) => chunks.push(c));
+          let streaming = false;
+
+          const beginStream = () => {
+            streaming = true;
+            res.writeHead(status, fwdHeaders);
+            const buffered = Buffer.concat(chunks);
+            if (buffered.length) {
+              if (!res.write(buffered)) {
+                upRes.pause();
+                res.once("drain", () => upRes.resume());
+              }
+            }
+          };
+
+          upRes.on("data", (c: Buffer) => {
+            if (streaming) {
+              if (!res.write(c)) {
+                upRes.pause();
+                res.once("drain", () => upRes.resume());
+              }
+              return;
+            }
+
+            chunks.push(c);
+            const buf = Buffer.concat(chunks).toString("utf8");
+
+            // While buffering, check for stream-level errors so we can retry.
+            if (isStreamError(buf)) {
+              return;
+            }
+
+            // For SSE: once we have at least one complete line we are past the
+            // point where the upstream would have sent an error event, so it
+            // is safe to begin streaming to the client.
+            if (isSSE && buf.includes("\n")) {
+              beginStream();
+            }
+          });
+
           upRes.on("error", () => {
             if (!res.writableEnded) {
               try {
@@ -427,7 +484,14 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
             }
             resolve({ ok: true, committed: true });
           });
+
           upRes.on("end", () => {
+            if (streaming) {
+              res.end();
+              resolve({ ok: true, committed: true });
+              return;
+            }
+
             const resBody = Buffer.concat(chunks);
             const errReason = isStreamError(resBody.toString("utf8"));
 
@@ -436,20 +500,6 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
               return;
             }
 
-            if (res.headersSent || res.writableEnded) {
-              resolve({ ok: true, committed: true });
-              return;
-            }
-
-            const fwdHeaders: Record<string, string | string[]> = {};
-            for (const [k, v] of Object.entries(upRes.headers)) {
-              if (v === undefined) continue;
-              const lk = k.toLowerCase();
-              if (lk === "content-length" || lk === "transfer-encoding") {
-                continue;
-              }
-              fwdHeaders[k] = v;
-            }
             res.writeHead(status, fwdHeaders);
             res.end(resBody);
             resolve({ ok: true, committed: true });
