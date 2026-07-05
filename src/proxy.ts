@@ -13,6 +13,11 @@ import type {
 import { resolveConfig, resolvePort } from "./config.js";
 import { applyPrefillFix, modelNeedsFix } from "./prefill-fix.js";
 import { extractThinkingProps, formatThinkingLog } from "./thinking-restore.js";
+import {
+  computeBillingHeader,
+  extractFirstUserMessageText,
+  injectBillingHeader,
+} from "./billing.js";
 
 const HOP_BY_HOP = new Set([
   "connection",
@@ -28,6 +33,11 @@ const HOP_BY_HOP = new Set([
 ]);
 
 const RETRY_STATUS = new Set([408, 409, 425, 429, 500, 504]);
+
+// Config headers that always override whatever the caller sent. These identify
+// the proxy as a specific Claude Code client upstream, so the caller's value
+// (which may come from a different client) must never leak through.
+const ALWAYS_OVERRIDE_HEADERS = new Set(["user-agent"]);
 
 // Statuses that indicate the API key itself is rejected (expired, revoked,
 // unauthorized). When multiple keys are configured and at least one other key
@@ -546,6 +556,8 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
     if (!out["accept"]) out["accept"] = "application/json";
 
     // Apply configured defaults only for headers the caller did NOT supply.
+    // Headers in ALWAYS_OVERRIDE_HEADERS (e.g. user-agent) always win so the
+    // proxy presents a consistent Claude Code identity upstream.
     // anthropic-beta is skipped here — it is always merged below so the
     // proxy's flags and the caller's flags are combined.
     if (config.upstreamHeaders) {
@@ -553,7 +565,9 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
         if (v === undefined) continue;
         const lk = k.toLowerCase();
         if (lk === "anthropic-beta") continue;
-        if (!clientSent.has(lk)) out[k] = v;
+        if (ALWAYS_OVERRIDE_HEADERS.has(lk) || !clientSent.has(lk)) {
+          out[k] = v;
+        }
       }
     }
 
@@ -1055,6 +1069,26 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
     }
   }
 
+  function maybeInjectBilling(buf: Buffer): Buffer {
+    if (!buf || buf.length === 0) return buf;
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(buf.toString("utf8")) as Record<string, unknown>;
+    } catch {
+      return buf;
+    }
+    if (!parsed || typeof parsed !== "object") return buf;
+    // The billing header is derived from the first user message's text, so it
+    // must be recomputed for every request.
+    const messageText = extractFirstUserMessageText(parsed);
+    const billingText = computeBillingHeader(messageText);
+    console.log(`[vsllm-proxy] billing ${billingText}`);
+    if (injectBillingHeader(parsed, billingText)) {
+      return Buffer.from(JSON.stringify(parsed));
+    }
+    return buf;
+  }
+
   const handler = async (
     req: IncomingMessage,
     res: ServerResponse,
@@ -1092,7 +1126,7 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
       if (routed.callType === "messages") {
         const prefilled = maybeApplyFix(raw, routed.callType);
         const result = applyMessagesFix(prefilled);
-        body = result.buf;
+        body = maybeInjectBilling(result.buf);
         sessionId = result.sessionId;
       } else if (routed.callType) {
         body = maybeApplyFix(raw, routed.callType);
@@ -1231,7 +1265,7 @@ export function route(pathname: string): RouteResult | null {
   if (pathname.startsWith("/v1/")) {
     return { upstreamPath: pathname, callType: null };
   }
-  
+
   return null;
 }
 

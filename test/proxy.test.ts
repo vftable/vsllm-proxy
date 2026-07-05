@@ -635,12 +635,12 @@ test("e2e: all client beta flags blacklisted leaves only config flags", async ()
 });
 
 test("e2e: client-supplied headers take precedence over config defaults", async () => {
-  let userAgent: string | undefined;
+  let customHdr: string | undefined;
   let anthropicVersion: string | undefined;
   const { proxy, upstream } = await boot(
     {
       upstreamHandler: async (req, res) => {
-        userAgent = req.headers["user-agent"] as string | undefined;
+        customHdr = req.headers["x-custom-hdr"] as string | undefined;
         anthropicVersion = req.headers["anthropic-version"] as
           | string
           | undefined;
@@ -650,7 +650,7 @@ test("e2e: client-supplied headers take precedence over config defaults", async 
     },
     {
       upstreamHeaders: {
-        "user-agent": "config-default-agent",
+        "x-custom-hdr": "config-default",
         "anthropic-version": "config-version",
       },
     },
@@ -658,23 +658,56 @@ test("e2e: client-supplied headers take precedence over config defaults", async 
 
   try {
     const port = (proxy.address() as { port: number }).port;
-    // Client supplies user-agent but NOT anthropic-version.
+    // Client supplies x-custom-hdr but NOT anthropic-version.
     await proxyRequest(port, {
       path: "/v1/chat/completions",
-      headers: { "user-agent": "my-custom-agent" },
+      headers: { "x-custom-hdr": "client-value" },
       body: { model: "gpt-4o", messages: [{ role: "user", content: "hi" }] },
     });
-    // Client header wins.
+    // Client header wins for non-controlled headers.
     assert.equal(
-      userAgent,
-      "my-custom-agent",
-      `client user-agent should win, got: ${userAgent}`,
+      customHdr,
+      "client-value",
+      `client header should win, got: ${customHdr}`,
     );
     // Missing client header falls back to config default.
     assert.equal(
       anthropicVersion,
       "config-version",
       `missing header should use default, got: ${anthropicVersion}`,
+    );
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test("e2e: config user-agent always wins over client-supplied value", async () => {
+  let userAgent: string | undefined;
+  const { proxy, upstream } = await boot(
+    {
+      upstreamHandler: async (req, res) => {
+        userAgent = req.headers["user-agent"] as string | undefined;
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      },
+    },
+    {
+      upstreamHeaders: { "user-agent": "claude-cli/9.9.9 (external, cli)" },
+    },
+  );
+
+  try {
+    const port = (proxy.address() as { port: number }).port;
+    await proxyRequest(port, {
+      path: "/v1/chat/completions",
+      headers: { "user-agent": "intruder-agent/1.0" },
+      body: { model: "gpt-4o", messages: [{ role: "user", content: "hi" }] },
+    });
+    assert.equal(
+      userAgent,
+      "claude-cli/9.9.9 (external, cli)",
+      `config user-agent must always win, got: ${userAgent}`,
     );
   } finally {
     await close(proxy);
@@ -1495,6 +1528,250 @@ test("e2e: /v1/messages generates uuid session_id when metadata missing", async 
     assert.match(
       inner.session_id,
       /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+    );
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test("e2e: /v1/messages injects billing header as first system block", async () => {
+  let captured: any;
+  const { proxy, upstream } = await boot({
+    upstreamHandler: async (req, res) => {
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      captured = JSON.parse(Buffer.concat(chunks).toString() || "{}");
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+    },
+  });
+
+  try {
+    const port = (proxy.address() as { port: number }).port;
+    await proxyRequest(port, {
+      path: "/v1/messages",
+      body: {
+        model: "claude-sonnet-4-6",
+        messages: [{ role: "user", content: "hi" }],
+        system: [
+          {
+            type: "text",
+            text: "You are Claude Code, Anthropic's official CLI for Claude.",
+            cache_control: { type: "ephemeral" },
+          },
+        ],
+      },
+    });
+    assert.ok(Array.isArray(captured.system), "system must be an array");
+    const sys = captured.system as Array<{ type: string; text: string }>;
+    assert.ok(
+      sys[0].text.startsWith("x-anthropic-billing-header:"),
+      `first block must be billing header, got: ${sys[0].text}`,
+    );
+    assert.ok(sys[0].text.includes("cc_version="));
+    assert.ok(sys[0].text.includes("cc_entrypoint=cli"));
+    // Original system block preserved.
+    assert.equal(sys.length, 2);
+    assert.ok(sys[1].text.includes("You are Claude Code"));
+    assert.deepEqual(
+      (sys[1] as { cache_control?: unknown }).cache_control,
+      { type: "ephemeral" },
+    );
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test("e2e: /v1/messages replaces an existing billing header from the client", async () => {
+  let captured: any;
+  const { proxy, upstream } = await boot({
+    upstreamHandler: async (req, res) => {
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      captured = JSON.parse(Buffer.concat(chunks).toString() || "{}");
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+    },
+  });
+
+  try {
+    const port = (proxy.address() as { port: number }).port;
+    await proxyRequest(port, {
+      path: "/v1/messages",
+      body: {
+        model: "claude-sonnet-4-6",
+        messages: [{ role: "user", content: "hi" }],
+        system: [
+          {
+            type: "text",
+            text: "x-anthropic-billing-header: LEGITIMATE_CLIENT_VALUE",
+          },
+          {
+            type: "text",
+            text: "You are Claude Code.",
+            cache_control: { type: "ephemeral" },
+          },
+        ],
+      },
+    });
+    const sys = captured.system as Array<{ type: string; text: string }>;
+    // Should still be two blocks (replaced, not duplicated).
+    assert.equal(sys.length, 2);
+    assert.ok(
+      sys[0].text.startsWith("x-anthropic-billing-header:"),
+      "first block must be billing header",
+    );
+    // The client's value must have been replaced.
+    assert.ok(
+      !sys[0].text.includes("LEGITIMATE_CLIENT_VALUE"),
+      `client billing value must be replaced, got: ${sys[0].text}`,
+    );
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test("e2e: /v1/messages converts string system to array with billing header", async () => {
+  let captured: any;
+  const { proxy, upstream } = await boot({
+    upstreamHandler: async (req, res) => {
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      captured = JSON.parse(Buffer.concat(chunks).toString() || "{}");
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+    },
+  });
+
+  try {
+    const port = (proxy.address() as { port: number }).port;
+    await proxyRequest(port, {
+      path: "/v1/messages",
+      body: {
+        model: "claude-sonnet-4-6",
+        messages: [{ role: "user", content: "hi" }],
+        system: "You are Claude Code.",
+      },
+    });
+    const sys = captured.system as Array<{ type: string; text: string }>;
+    assert.ok(Array.isArray(sys));
+    assert.equal(sys.length, 2);
+    assert.ok(sys[0].text.startsWith("x-anthropic-billing-header:"));
+    assert.equal(sys[1].text, "You are Claude Code.");
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test("e2e: billing header is not injected for non-messages endpoints", async () => {
+  let captured: any;
+  const { proxy, upstream } = await boot({
+    upstreamHandler: async (req, res) => {
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      captured = JSON.parse(Buffer.concat(chunks).toString() || "{}");
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+    },
+  });
+
+  try {
+    const port = (proxy.address() as { port: number }).port;
+    await proxyRequest(port, {
+      path: "/v1/chat/completions",
+      body: { model: "gpt-4o", messages: [{ role: "user", content: "hi" }] },
+    });
+    assert.equal(captured.system, undefined, "system must not be added");
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test("e2e: /v1/messages billing header matches spec test vector for 'hey'", async () => {
+  let captured: any;
+  const { proxy, upstream } = await boot({
+    upstreamHandler: async (req, res) => {
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      captured = JSON.parse(Buffer.concat(chunks).toString() || "{}");
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+    },
+  });
+
+  try {
+    const port = (proxy.address() as { port: number }).port;
+    await proxyRequest(port, {
+      path: "/v1/messages",
+      body: {
+        model: "claude-sonnet-4-6",
+        messages: [{ role: "user", content: "hey" }],
+      },
+    });
+    const sys = captured.system as Array<{ type: string; text: string }>;
+    assert.ok(Array.isArray(sys));
+    const billing = sys[0].text;
+    // Exact spec test vector: message "hey" -> cc_version=2.1.37.0d9, cch=fa690
+    assert.ok(
+      billing.includes("cc_version=2.1.37.0d9;"),
+      `cc_version mismatch: ${billing}`,
+    );
+    assert.ok(
+      billing.includes("cch=fa690;"),
+      `cch mismatch: ${billing}`,
+    );
+    assert.ok(billing.includes("cc_entrypoint=cli;"));
+    // Billing block must not carry cache_control.
+    assert.equal(
+      (sys[0] as { cache_control?: unknown }).cache_control,
+      undefined,
+    );
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test("e2e: /v1/messages billing header recomputes per-request", async () => {
+  const captured: string[] = [];
+  const { proxy, upstream } = await boot({
+    upstreamHandler: async (req, res) => {
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const parsed = JSON.parse(Buffer.concat(chunks).toString() || "{}");
+      const sys = parsed.system as Array<{ text: string }>;
+      captured.push(sys?.[0]?.text ?? "");
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+    },
+  });
+
+  try {
+    const port = (proxy.address() as { port: number }).port;
+    await proxyRequest(port, {
+      path: "/v1/messages",
+      body: {
+        model: "claude-sonnet-4-6",
+        messages: [{ role: "user", content: "hey" }],
+      },
+    });
+    await proxyRequest(port, {
+      path: "/v1/messages",
+      body: {
+        model: "claude-sonnet-4-6",
+        messages: [{ role: "user", content: "world" }],
+      },
+    });
+    assert.equal(captured.length, 2);
+    assert.notEqual(
+      captured[0],
+      captured[1],
+      "different messages must produce different billing headers",
     );
   } finally {
     await close(proxy);

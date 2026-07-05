@@ -16,19 +16,6 @@ const CLAUDE_CODE_BETA_FLAGS = [
   "effort-2025-11-24",
 ];
 
-function detectClaudeCodeVersion(): string {
-  try {
-    const out = execSync("claude --version 2>&1", {
-      encoding: "utf8",
-      timeout: 2000,
-      stdio: ["pipe", "pipe", "ignore"],
-    });
-    const m = out.match(/\d+\.\d+\.\d+/);
-    if (m) return m[0];
-  } catch {}
-  return "2.1.185";
-}
-
 function detectNodeVersion(): string {
   return `v${process.versions.node}`;
 }
@@ -54,15 +41,16 @@ function detectPlatform(): { arch: string; os: string } {
 }
 
 function buildDefaultUpstreamHeaders(): Record<string, string> {
-  const ccVersion = detectClaudeCodeVersion();
   const nodeVersion = detectNodeVersion();
   const { arch, os } = detectPlatform();
+
+  // this is for claude oauth antiban. hi. they check the billing header now. okay
   return {
-    "user-agent": `claude-cli/${ccVersion} (external, cli)`,
+    "user-agent": `claude-cli/2.1.37 (external, cli)`,
     "x-app": "cli",
     "x-stainless-runtime": "node",
     "x-stainless-runtime-version": nodeVersion,
-    "x-stainless-package-version": ccVersion,
+    "x-stainless-package-version": "0.94.0",
     "x-stainless-timeout": "600",
     "x-stainless-lang": "js",
     "x-stainless-arch": arch,
