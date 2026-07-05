@@ -32,6 +32,12 @@ const HOP_BY_HOP = new Set([
 
 const RETRY_STATUS = new Set([408, 409, 425, 429, 500, 504]);
 
+// Statuses that indicate the API key itself is rejected (expired, revoked,
+// unauthorized). When multiple keys are configured and at least one other key
+// is still usable, these trigger an immediate failover to the next key and the
+// offending key is disabled for the lifetime of the process.
+const AUTH_FAIL_STATUS = new Set([401, 403]);
+
 function flattenHeaders(
   headers: IncomingMessage["headers"],
 ): Record<string, string> {
@@ -330,20 +336,37 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
 
     const available = keyStates
       .map((_, i) => i)
-      .filter((i) => !tried.has(i) && keyStates[i].rateLimitedUntil <= now);
+      .filter(
+        (i) =>
+          !tried.has(i) &&
+          !keyStates[i].authFailed &&
+          keyStates[i].rateLimitedUntil <= now,
+      );
 
     if (available.length === 1) return available[0];
     if (available.length > 1) {
       return available[Math.floor(Math.random() * available.length)];
     }
 
-    const untried = keyStates.map((_, i) => i).filter((i) => !tried.has(i));
+    // No fresh keys — fall back to untried keys that aren't permanently bad.
+    const untried = keyStates
+      .map((_, i) => i)
+      .filter((i) => !tried.has(i) && !keyStates[i].authFailed);
     if (untried.length > 0) {
       return untried.reduce((best, i) =>
         keyStates[i].rateLimitedUntil < keyStates[best].rateLimitedUntil
           ? i
           : best,
       );
+    }
+
+    // Everything is either tried or auth-failed. As a last resort, avoid
+    // auth-failed keys if any other key exists.
+    const nonAuthFailed = keyStates
+      .map((_, i) => i)
+      .filter((i) => !keyStates[i].authFailed);
+    if (nonAuthFailed.length > 0) {
+      return nonAuthFailed[Math.floor(Math.random() * nonAuthFailed.length)];
     }
 
     return Math.floor(Math.random() * keyStates.length);
@@ -353,7 +376,10 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
     const now = Date.now();
     return keyStates
       .map((k, i) => ({ k, i }))
-      .filter(({ k, i }) => i !== exclude && k.rateLimitedUntil <= now)
+      .filter(
+        ({ k, i }) =>
+          i !== exclude && !k.authFailed && k.rateLimitedUntil <= now,
+      )
       .map(({ k }) => k.keyId);
   }
 
@@ -448,8 +474,48 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
 
     return new Promise((resolve) => {
       let connectionTimer: ReturnType<typeof setTimeout> | null = null;
+      let settled = false;
+      let upResRef: IncomingMessage | null = null;
+      let proxyReq: http.ClientRequest;
 
-      const proxyReq = transport.request(
+      function finish(result: AttemptResult): void {
+        if (settled) return;
+        settled = true;
+        if (connectionTimer) {
+          clearTimeout(connectionTimer);
+          connectionTimer = null;
+        }
+        req.off("close", onClientClose);
+        resolve(result);
+      }
+
+      // Memory-leak fix: if the client disconnects before we have finished
+      // writing the response, destroy the in-flight upstream request and
+      // response so we release the pooled socket immediately instead of
+      // holding it (and buffering into a dead response) until upstream ends.
+      function onClientClose(): void {
+        if (settled) return;
+        if (connectionTimer) {
+          clearTimeout(connectionTimer);
+          connectionTimer = null;
+        }
+        try {
+          proxyReq.destroy();
+        } catch {}
+        if (upResRef) {
+          try {
+            upResRef.destroy();
+          } catch {}
+        }
+        console.warn(
+          `[vsllm-proxy] client-disconnected key=${keyId} ${reqMethod} ${upstreamPath}`,
+        );
+        finish({ ok: true, committed: true });
+      }
+
+      req.on("close", onClientClose);
+
+      proxyReq = transport.request(
         {
           protocol: upstream.protocol,
           hostname: upstream.hostname,
@@ -460,6 +526,7 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
           agent: upstreamAgent,
         },
         (upRes) => {
+          upResRef = upRes;
           if (connectionTimer) {
             clearTimeout(connectionTimer);
             connectionTimer = null;
@@ -490,11 +557,49 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
               status,
               `status ${status}`,
             ).then(() =>
-              resolve({
+              finish({
                 ok: false,
                 status,
                 reason: `status ${status}`,
                 rateLimitMs,
+              }),
+            );
+            return;
+          }
+
+          // Auth failures (401/403): when the key itself is rejected and at
+          // least one other non-disabled key exists, fail over to the next
+          // key instead of returning the error to the client. The offending
+          // key is disabled in forward() so it is skipped on subsequent
+          // attempts and requests. When no other key is available the error
+          // falls through to the generic non-2xx path below and is forwarded.
+          if (
+            AUTH_FAIL_STATUS.has(status) &&
+            keyStates.some(
+              (_, i) => i !== keyIndex && !keyStates[i].authFailed,
+            )
+          ) {
+            console.warn(
+              `[vsllm-proxy] auth-fail key=${keyId} status=${status} ${reqMethod} ${upstreamPath} — failing over to another key`,
+            );
+            captureAndLogFailure(
+              "auth-fail",
+              reqMethod,
+              upstreamPath,
+              keyId,
+              clientHeaders,
+              outHeaders,
+              body,
+              capturedHeaders,
+              upRes,
+              status,
+              `auth status ${status}`,
+            ).then(() =>
+              finish({
+                ok: false,
+                status,
+                reason: `auth status ${status}`,
+                authFailed: true,
               }),
             );
             return;
@@ -533,7 +638,7 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
                 res.writeHead(status, fwdHeaders);
                 res.end(resBody ?? "");
               }
-              resolve({ ok: true, committed: true });
+              finish({ ok: true, committed: true });
             });
             return;
           }
@@ -545,7 +650,7 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
           // before) since there is no streaming benefit.
           if (res.headersSent || res.writableEnded) {
             upRes.resume();
-            resolve({ ok: true, committed: true });
+            finish({ ok: true, committed: true });
             return;
           }
 
@@ -575,6 +680,9 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
             );
             res.writeHead(status, fwdHeaders);
             const buffered = Buffer.concat(chunks);
+            // Release the buffered chunks so they can be GC'd while the
+            // (potentially long-lived) stream continues.
+            chunks.length = 0;
             if (buffered.length) {
               if (!res.write(buffered)) {
                 upRes.pause();
@@ -614,6 +722,7 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
                 res.end();
               } catch {}
             }
+            chunks.length = 0;
             if (streaming) {
               const elapsed = (
                 (Date.now() - streamStartTime) / 1000
@@ -622,7 +731,7 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
                 `[vsllm-proxy] stream-error key=${keyId} ${reqMethod} ${upstreamPath} (${elapsed}s)`,
               );
             }
-            resolve({ ok: true, committed: true });
+            finish({ ok: true, committed: true });
           });
 
           upRes.on("end", () => {
@@ -634,24 +743,25 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
               console.log(
                 `[vsllm-proxy] stream-end key=${keyId} ${reqMethod} ${upstreamPath} (${elapsed}s)`,
               );
-              resolve({ ok: true, committed: true });
+              finish({ ok: true, committed: true });
               return;
             }
 
             const resBody = Buffer.concat(chunks);
+            chunks.length = 0;
             const errReason = isStreamError(resBody.toString("utf8"));
 
             if (errReason) {
               console.warn(
                 `[vsllm-proxy] fail key=${keyId} stream-error ${reqMethod} ${upstreamPath} (${errReason})`,
               );
-              resolve({ ok: false, reason: `stream error: ${errReason}` });
+              finish({ ok: false, reason: `stream error: ${errReason}` });
               return;
             }
 
             res.writeHead(status, fwdHeaders);
             res.end(resBody);
-            resolve({ ok: true, committed: true });
+            finish({ ok: true, committed: true });
           });
         },
       );
@@ -682,7 +792,7 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
           null,
           err.message,
         );
-        resolve({ ok: false, reason: err.message });
+        finish({ ok: false, reason: err.message });
       });
 
       if (body && body.length) proxyReq.write(body);
@@ -721,6 +831,20 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
       if (result.ok) return;
 
       lastReason = result.reason || lastReason;
+
+      // Auth failures (401/403): disable the key for the lifetime of the
+      // process and retry immediately with a different key — no backoff sleep.
+      if (result.authFailed && keyStates.length > 0) {
+        keyStates[keyIndex].authFailed = true;
+        console.warn(
+          `[vsllm-proxy] disabled key=${keyStates[keyIndex].keyId} ` +
+            `(auth status ${result.status})` +
+            (availableKeyIds().length > 0
+              ? ` available=${availableKeyIds().join(",")}`
+              : " (no other keys available)"),
+        );
+        continue;
+      }
 
       if (result.rateLimitMs && result.rateLimitMs > 0 && keyStates.length > 0) {
         keyStates[keyIndex].rateLimitedUntil =

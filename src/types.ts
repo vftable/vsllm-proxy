@@ -23,12 +23,14 @@ export interface AttemptResult {
   status?: number;
   reason?: string;
   rateLimitMs?: number;
+  authFailed?: boolean;
 }
 
 export interface KeyState {
   key: string;
   keyId: string;
   rateLimitedUntil: number;
+  authFailed?: boolean;
 }
 
 export interface UpstreamErrorResponse {

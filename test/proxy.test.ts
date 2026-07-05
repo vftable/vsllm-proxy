@@ -558,6 +558,208 @@ test("e2e: rate-limited keys are skipped on subsequent requests", async () => {
   }
 });
 
+test("e2e: 401 unauthorized key fails over to another working key", async () => {
+  const seen: string[] = [];
+  const { proxy, upstream } = await boot(
+    {
+      upstreamHandler: (req, res) => {
+        const auth = req.headers["authorization"] ?? "";
+        seen.push(auth);
+        if (auth === "Bearer bad-key") {
+          res.writeHead(401, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: { message: "invalid key" } }));
+          return;
+        }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      },
+    },
+    { upstreamApiKey: ["bad-key", "good-key"], retryIntervalMs: 5 },
+  );
+
+  try {
+    const port = (proxy.address() as { port: number }).port;
+    const out = await proxyRequest(port, {
+      path: "/v1/chat/completions",
+      body: { model: "gpt-4o", messages: [{ role: "user", content: "hi" }] },
+    });
+    assert.equal(out.status, 200);
+    assert.ok(seen.includes("Bearer good-key"), "should have tried good-key");
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test("e2e: 403 forbidden key fails over to another working key", async () => {
+  const seen: string[] = [];
+  const { proxy, upstream } = await boot(
+    {
+      upstreamHandler: (req, res) => {
+        const auth = req.headers["authorization"] ?? "";
+        seen.push(auth);
+        if (auth === "Bearer bad-key") {
+          res.writeHead(403, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: { message: "forbidden" } }));
+          return;
+        }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      },
+    },
+    { upstreamApiKey: ["bad-key", "good-key"], retryIntervalMs: 5 },
+  );
+
+  try {
+    const port = (proxy.address() as { port: number }).port;
+    const out = await proxyRequest(port, {
+      path: "/v1/chat/completions",
+      body: { model: "gpt-4o", messages: [{ role: "user", content: "hi" }] },
+    });
+    assert.equal(out.status, 200);
+    assert.ok(seen.includes("Bearer good-key"), "should have tried good-key");
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test("e2e: single key 401 is forwarded to the client without retry", async () => {
+  let hits = 0;
+  const { proxy, upstream } = await boot({
+    upstreamHandler: (req, res) => {
+      hits++;
+      res.writeHead(401, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "invalid key" } }));
+    },
+  });
+
+  try {
+    const port = (proxy.address() as { port: number }).port;
+    const out = await proxyRequest(port, {
+      path: "/v1/chat/completions",
+      body: { model: "gpt-4o", messages: [{ role: "user", content: "hi" }] },
+    });
+    assert.equal(out.status, 401);
+    assert.equal(hits, 1, "single-key 401 must not retry");
+    assert.deepEqual(JSON.parse(out.body), {
+      error: { message: "invalid key" },
+    });
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test("e2e: all keys returning 401 forwards the error to the client", async () => {
+  let hits = 0;
+  const { proxy, upstream } = await boot(
+    {
+      upstreamHandler: (req, res) => {
+        hits++;
+        res.writeHead(401, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "invalid key" } }));
+      },
+    },
+    { upstreamApiKey: ["key-a", "key-b"], retryIntervalMs: 5 },
+  );
+
+  try {
+    const port = (proxy.address() as { port: number }).port;
+    const out = await proxyRequest(port, {
+      path: "/v1/chat/completions",
+      body: { model: "gpt-4o", messages: [{ role: "user", content: "hi" }] },
+    });
+    assert.equal(out.status, 401);
+    assert.equal(hits, 2, "should try each key exactly once");
+    assert.deepEqual(JSON.parse(out.body), {
+      error: { message: "invalid key" },
+    });
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test("e2e: auth-failed key is skipped on subsequent requests", async () => {
+  const seen: string[] = [];
+  const { proxy, upstream } = await boot(
+    {
+      upstreamHandler: (req, res) => {
+        const auth = req.headers["authorization"] ?? "";
+        seen.push(auth);
+        if (auth === "Bearer key-a") {
+          res.writeHead(401, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: "invalid key" }));
+          return;
+        }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      },
+    },
+    { upstreamApiKey: ["key-a", "key-b", "key-c"], retryIntervalMs: 5 },
+  );
+
+  try {
+    const port = (proxy.address() as { port: number }).port;
+    const reqBody = {
+      path: "/v1/chat/completions",
+      body: { model: "gpt-4o", messages: [{ role: "user", content: "hi" }] },
+    };
+
+    // Phase 1: send requests until key-a is hit (random selection means it
+    // may not be picked on the first try). Once hit, it gets disabled.
+    for (let i = 0; i < 30; i++) {
+      seen.length = 0;
+      await proxyRequest(port, reqBody);
+      if (seen.includes("Bearer key-a")) break;
+    }
+    assert.ok(
+      seen.includes("Bearer key-a"),
+      "phase 1 should have triggered key-a's 401",
+    );
+
+    // Phase 2: key-a is now disabled — it must not be selected again.
+    seen.length = 0;
+    await proxyRequest(port, reqBody);
+    assert.ok(
+      !seen.includes("Bearer key-a"),
+      "auth-failed key-a should not be used: " + seen.join(", "),
+    );
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test("e2e: 401 is not retried when no upstreamApiKey is configured", async () => {
+  let hits = 0;
+  const { proxy, upstream } = await boot(
+    {
+      upstreamHandler: (req, res) => {
+        hits++;
+        res.writeHead(401, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "invalid caller key" } }));
+      },
+    },
+    { upstreamApiKey: "", retryIntervalMs: 5 },
+  );
+
+  try {
+    const port = (proxy.address() as { port: number }).port;
+    const out = await proxyRequest(port, {
+      path: "/v1/chat/completions",
+      headers: { authorization: "Bearer caller-key" },
+      body: { model: "gpt-4o", messages: [{ role: "user", content: "hi" }] },
+    });
+    assert.equal(out.status, 401);
+    assert.equal(hits, 1, "no failover possible without configured keys");
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
 test("e2e: /v1/messages overwrites metadata and sets anthropic-version header", async () => {
   let captured: any;
   let sessionHeader: string | undefined;
