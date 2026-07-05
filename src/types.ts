@@ -10,6 +10,8 @@ export interface ProxyConfig {
   retryAttempts: number;
   retryIntervalMs: number;
   enableRequestLogging: boolean;
+  affinityFailThreshold: number;
+  blacklistBetaFlags: string[];
 }
 
 export interface RouteResult {
@@ -33,6 +35,7 @@ export interface KeyState {
   rateLimitedUntil: number;
   authFailed?: boolean;
   successModels?: Set<string>;
+  modelFails?: Map<string, number>;
 }
 
 export interface UpstreamErrorResponse {

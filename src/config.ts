@@ -40,6 +40,7 @@ function detectPlatform(): { arch: string; os: string } {
       : process.arch === "arm64"
         ? "arm64"
         : process.arch;
+
   const platform =
     process.platform === "win32"
       ? "Windows"
@@ -48,6 +49,7 @@ function detectPlatform(): { arch: string; os: string } {
         : process.platform === "linux"
           ? "Linux"
           : process.platform;
+
   return { arch, os: platform };
 }
 
@@ -82,6 +84,8 @@ const DEFAULTS: ProxyConfig = {
   retryAttempts: 10,
   retryIntervalMs: 3000,
   enableRequestLogging: true,
+  affinityFailThreshold: 3,
+  blacklistBetaFlags: ["redact-thinking-2026-02-12"],
 };
 
 export function loadConfigFile(): Record<string, unknown> {
@@ -134,6 +138,20 @@ export function resolveConfig(opts: CreateProxyOpts = {}): ProxyConfig {
       "enableRequestLogging",
       DEFAULTS.enableRequestLogging,
     ),
+    affinityFailThreshold: Math.max(
+      1,
+      parseInt(
+        String(pick("affinityFailThreshold", DEFAULTS.affinityFailThreshold)),
+        10,
+      ) || DEFAULTS.affinityFailThreshold,
+    ),
+    blacklistBetaFlags: Array.from(
+      (pick("blacklistBetaFlags", DEFAULTS.blacklistBetaFlags) as unknown[]) ||
+        [],
+    )
+      .filter((f): f is string => typeof f === "string" && f.length > 0)
+      .map((f) => f.trim())
+      .filter((f) => f.length > 0),
     upstreamHeaders: {
       ...DEFAULTS.upstreamHeaders,
       ...((pick("upstreamHeaders", {}) as Record<string, string>) || {}),

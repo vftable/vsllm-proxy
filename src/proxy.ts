@@ -12,10 +12,7 @@ import type {
 } from "./types.js";
 import { resolveConfig, resolvePort } from "./config.js";
 import { applyPrefillFix, modelNeedsFix } from "./prefill-fix.js";
-import {
-  extractThinkingProps,
-  formatThinkingLog,
-} from "./thinking-restore.js";
+import { extractThinkingProps, formatThinkingLog } from "./thinking-restore.js";
 
 const HOP_BY_HOP = new Set([
   "connection",
@@ -65,6 +62,32 @@ function extractModel(body: Buffer | null): string | null {
   } catch {
     return null;
   }
+}
+
+// Split a comma-separated flag header (e.g. anthropic-beta) into a de-duplicated
+// array. Flags from `primary` are always kept; flags from `secondary` are
+// dropped when they appear in `blacklist`. Returns the joined string or
+// undefined when nothing remains.
+function mergeFlagHeader(
+  primary: string | undefined,
+  secondary: string | undefined,
+  blacklist: Set<string>,
+): string | undefined {
+  const parts: string[] = [];
+  const seen = new Set<string>();
+  const add = (raw: string | undefined, filter: boolean): void => {
+    if (!raw) return;
+    for (const flag of raw.split(",")) {
+      const f = flag.trim();
+      if (!f || seen.has(f)) continue;
+      if (filter && blacklist.has(f)) continue;
+      seen.add(f);
+      parts.push(f);
+    }
+  };
+  add(primary, false);
+  add(secondary, true);
+  return parts.length > 0 ? parts.join(",") : undefined;
 }
 
 function prettyBody(body: Buffer | string | null): string {
@@ -330,7 +353,10 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
     keyId: maskKey(k),
     rateLimitedUntil: 0,
     successModels: new Set<string>(),
+    modelFails: new Map<string, number>(),
   }));
+
+  const betaFlagBlacklist = new Set(config.blacklistBetaFlags);
 
   const upstreamAgent = config.upstreamBaseUrl.startsWith("https:")
     ? new https.Agent({
@@ -410,6 +436,52 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
       .map(({ k }) => k.keyId);
   }
 
+  // Record a clean success for a (key, model) pair so future requests for the
+  // same model prefer it. Resets the consecutive-failure counter for the pair.
+  function recordSuccess(keyIndex: number, model: string | null): void {
+    if (!model || keyStates.length === 0) return;
+    const s = keyStates[keyIndex];
+    s.modelFails?.delete(model);
+    if (s.successModels && !s.successModels.has(model)) {
+      s.successModels.add(model);
+      console.log(`[vsllm-proxy] learned key=${s.keyId} serves model=${model}`);
+    }
+  }
+
+  // Record a failure for a (key, model) pair. Only pairs that were previously
+  // learned are tracked — there is nothing to demote for an unproven pair. When
+  // the consecutive-failure count reaches the configured threshold, the model
+  // is evicted from the key's preferred list so it stops being favoured until
+  // it earns the spot back with a clean success.
+  function recordFailure(
+    keyIndex: number,
+    model: string | null,
+    status?: number,
+  ): void {
+    if (!model || keyStates.length === 0) return;
+    const s = keyStates[keyIndex];
+    if (!s.successModels?.has(model)) return;
+    const fails = (s.modelFails?.get(model) ?? 0) + 1;
+    s.modelFails?.set(model, fails);
+    if (fails >= config.affinityFailThreshold) {
+      s.successModels.delete(model);
+      s.modelFails?.delete(model);
+      console.warn(
+        `[vsllm-proxy] evicted key=${s.keyId} from model=${model} ` +
+          `after ${fails} consecutive failures (last status ${status ?? "N/A"})`,
+      );
+    }
+  }
+
+  // Wipe all affinity for a key — used when the key is globally disabled by an
+  // auth failure so it can never be preferred again.
+  function clearAffinity(keyIndex: number): void {
+    if (keyStates.length === 0) return;
+    const s = keyStates[keyIndex];
+    s.successModels?.clear();
+    s.modelFails?.clear();
+  }
+
   function resolveAuth(
     req: IncomingMessage,
     keyIndex: number,
@@ -422,18 +494,18 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
         keyId: entry.keyId,
       };
     }
+
     const hdr = req.headers["authorization"];
     if (hdr) {
       const rawKey =
-        typeof hdr === "string"
-          ? hdr.replace(/^Bearer\s+/i, "").trim()
-          : null;
+        typeof hdr === "string" ? hdr.replace(/^Bearer\s+/i, "").trim() : null;
       return {
         auth: hdr,
         rawKey,
         keyId: rawKey ? maskKey(rawKey) : "(caller)",
       };
     }
+
     return { auth: null, rawKey: null, keyId: "(none)" };
   }
 
@@ -445,21 +517,60 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
     sessionId: string | null,
   ): Record<string, string> {
     const out: Record<string, string> = {};
+    // Track which headers the caller supplied so the configured defaults
+    // below only fill in gaps instead of overriding caller values.
+    const clientSent = new Set<string>();
+
+    // The anthropic-beta header is special: it is a comma-separated list of
+    // feature flags. We capture the caller's value separately so it can be
+    // split, blacklisted, and merged with the proxy's configured flags below
+    // rather than being blindly overwritten.
+    let clientBeta: string | undefined;
     for (const [k, v] of Object.entries(req.headers)) {
-      if (HOP_BY_HOP.has(k.toLowerCase())) continue;
-      if (v !== undefined) out[k] = Array.isArray(v) ? v[0] : v;
+      const lk = k.toLowerCase();
+      if (HOP_BY_HOP.has(lk)) continue;
+      if (v === undefined) continue;
+      clientSent.add(lk);
+      if (lk === "anthropic-beta") {
+        clientBeta = Array.isArray(v) ? v.join(",") : v;
+        continue;
+      }
+      out[k] = Array.isArray(v) ? v[0] : v;
     }
+
     out["host"] = config.upstreamHost;
     if (auth) out["authorization"] = auth;
     delete out["x-api-key"];
     delete out["accept-encoding"];
     if (bodyLen > 0) out["content-length"] = String(bodyLen);
     if (!out["accept"]) out["accept"] = "application/json";
+
+    // Apply configured defaults only for headers the caller did NOT supply.
+    // anthropic-beta is skipped here — it is always merged below so the
+    // proxy's flags and the caller's flags are combined.
     if (config.upstreamHeaders) {
       for (const [k, v] of Object.entries(config.upstreamHeaders)) {
-        if (v !== undefined) out[k] = v;
+        if (v === undefined) continue;
+        const lk = k.toLowerCase();
+        if (lk === "anthropic-beta") continue;
+        if (!clientSent.has(lk)) out[k] = v;
       }
     }
+
+    // Merge the proxy's configured flags (always kept) with the caller's flags
+    // (filtered against the blacklist), de-duplicate, and re-join.
+    const merged = mergeFlagHeader(
+      config.upstreamHeaders?.["anthropic-beta"],
+      clientBeta,
+      betaFlagBlacklist,
+    );
+
+    if (merged) {
+      out["anthropic-beta"] = merged;
+    } else {
+      delete out["anthropic-beta"];
+    }
+
     if (sessionId) out["x-claude-code-session-id"] = sessionId;
     return out;
   }
@@ -482,6 +593,7 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
           type: "auth_error",
         },
       });
+
       return Promise.resolve({ ok: true, committed: true });
     }
 
@@ -526,6 +638,7 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
           clearTimeout(connectionTimer);
           connectionTimer = null;
         }
+
         try {
           proxyReq.destroy();
         } catch {}
@@ -534,9 +647,11 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
             upResRef.destroy();
           } catch {}
         }
+
         console.warn(
           `[vsllm-proxy] client-disconnected key=${keyId} ${reqMethod} ${upstreamPath}`,
         );
+
         finish({ ok: true, committed: true });
       }
 
@@ -571,6 +686,7 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
                   ? ` retry_after=${Math.ceil(rateLimitMs / 1000)}s`
                   : ""),
             );
+
             captureAndLogFailure(
               "retry",
               reqMethod,
@@ -591,6 +707,7 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
                 rateLimitMs,
               }),
             );
+
             return;
           }
 
@@ -602,13 +719,12 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
           // falls through to the generic non-2xx path below and is forwarded.
           if (
             AUTH_FAIL_STATUS.has(status) &&
-            keyStates.some(
-              (_, i) => i !== keyIndex && !keyStates[i].authFailed,
-            )
+            keyStates.some((_, i) => i !== keyIndex && !keyStates[i].authFailed)
           ) {
             console.warn(
               `[vsllm-proxy] auth-fail key=${keyId} status=${status} ${reqMethod} ${upstreamPath} — failing over to another key`,
             );
+
             captureAndLogFailure(
               "auth-fail",
               reqMethod,
@@ -629,6 +745,7 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
                 authFailed: true,
               }),
             );
+
             return;
           }
 
@@ -639,6 +756,7 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
             console.warn(
               `[vsllm-proxy] fail key=${keyId} status=${status} ${reqMethod} ${upstreamPath}`,
             );
+
             captureAndLogFailure(
               "upstream",
               reqMethod,
@@ -667,6 +785,7 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
               }
               finish({ ok: true, committed: true });
             });
+
             return;
           }
 
@@ -694,6 +813,7 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
           const contentType = String(
             upRes.headers["content-type"] || "",
           ).toLowerCase();
+
           const isSSE = contentType.includes("text/event-stream");
 
           const chunks: Buffer[] = [];
@@ -749,27 +869,31 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
                 res.end();
               } catch {}
             }
+
             chunks.length = 0;
             if (streaming) {
-              const elapsed = (
-                (Date.now() - streamStartTime) / 1000
-              ).toFixed(1);
+              const elapsed = ((Date.now() - streamStartTime) / 1000).toFixed(
+                1,
+              );
               console.warn(
                 `[vsllm-proxy] stream-error key=${keyId} ${reqMethod} ${upstreamPath} (${elapsed}s)`,
               );
             }
+
             finish({ ok: true, committed: true });
           });
 
           upRes.on("end", () => {
             if (streaming) {
               res.end();
-              const elapsed = (
-                (Date.now() - streamStartTime) / 1000
-              ).toFixed(1);
+              const elapsed = ((Date.now() - streamStartTime) / 1000).toFixed(
+                1,
+              );
+
               console.log(
                 `[vsllm-proxy] stream-end key=${keyId} ${reqMethod} ${upstreamPath} (${elapsed}s)`,
               );
+
               finish({ ok: true, committed: true, served: true });
               return;
             }
@@ -782,6 +906,7 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
               console.warn(
                 `[vsllm-proxy] fail key=${keyId} stream-error ${reqMethod} ${upstreamPath} (${errReason})`,
               );
+
               finish({ ok: false, reason: `stream error: ${errReason}` });
               return;
             }
@@ -803,9 +928,11 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
           clearTimeout(connectionTimer);
           connectionTimer = null;
         }
+
         console.warn(
           `[vsllm-proxy] fail key=${keyId} error ${reqMethod} ${upstreamPath} (${err.message})`,
         );
+
         logFailure(
           "error",
           reqMethod,
@@ -819,6 +946,7 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
           null,
           err.message,
         );
+
         finish({ ok: false, reason: err.message });
       });
 
@@ -859,24 +987,18 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
       if (result.ok) {
         // Remember that this key successfully served this model so future
         // requests for the same model prefer it over unproven keys.
-        if (result.served && model && keyStates.length > 0) {
-          const learned = keyStates[keyIndex].successModels;
-          if (learned && !learned.has(model)) {
-            learned.add(model);
-            console.log(
-              `[vsllm-proxy] learned key=${keyStates[keyIndex].keyId} serves model=${model}`,
-            );
-          }
-        }
+        if (result.served) recordSuccess(keyIndex, model);
         return;
       }
 
       lastReason = result.reason || lastReason;
 
       // Auth failures (401/403): disable the key for the lifetime of the
-      // process and retry immediately with a different key — no backoff sleep.
+      // process, wipe all of its learned affinities, and retry immediately
+      // with a different key — no backoff sleep.
       if (result.authFailed && keyStates.length > 0) {
         keyStates[keyIndex].authFailed = true;
+        clearAffinity(keyIndex);
         console.warn(
           `[vsllm-proxy] disabled key=${keyStates[keyIndex].keyId} ` +
             `(auth status ${result.status})` +
@@ -887,9 +1009,18 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
         continue;
       }
 
-      if (result.rateLimitMs && result.rateLimitMs > 0 && keyStates.length > 0) {
-        keyStates[keyIndex].rateLimitedUntil =
-          Date.now() + result.rateLimitMs;
+      // Any other failure (rate limit, 5xx, connection error, stream error)
+      // counts against the (key, model) pair's affinity. A few transient
+      // failures are tolerated; sustained failure evicts the pair so the
+      // proxy stops routing to a key that keeps dying for this model.
+      recordFailure(keyIndex, model, result.status);
+
+      if (
+        result.rateLimitMs &&
+        result.rateLimitMs > 0 &&
+        keyStates.length > 0
+      ) {
+        keyStates[keyIndex].rateLimitedUntil = Date.now() + result.rateLimitMs;
         const avail = availableKeyIds(keyIndex);
         console.warn(
           `[vsllm-proxy] rate-limited key=${keyStates[keyIndex].keyId} ` +
@@ -957,6 +1088,7 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
       const raw = await readBody(req);
       let body: Buffer;
       let sessionId: string | null = null;
+
       if (routed.callType === "messages") {
         const prefilled = maybeApplyFix(raw, routed.callType);
         const result = applyMessagesFix(prefilled);
@@ -1025,12 +1157,14 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
 
 export function maybeApplyFix(buf: Buffer, callType: string): Buffer {
   if (!buf || buf.length === 0) return buf;
+
   let body: Record<string, unknown>;
   try {
     body = JSON.parse(buf.toString("utf8")) as Record<string, unknown>;
   } catch {
     return buf;
   }
+
   if (!body || typeof body !== "object") return buf;
   const changed = applyPrefillFix(body, callType);
   if (!changed) return buf;
@@ -1044,12 +1178,14 @@ export function applyMessagesFix(buf: Buffer): {
   if (!buf || buf.length === 0) {
     return { buf, sessionId: "" };
   }
+
   let body: Record<string, unknown>;
   try {
     body = JSON.parse(buf.toString("utf8")) as Record<string, unknown>;
   } catch {
     return { buf, sessionId: "" };
   }
+
   if (!body || typeof body !== "object") {
     return { buf, sessionId: "" };
   }
@@ -1079,24 +1215,26 @@ export function route(pathname: string): RouteResult | null {
   if (pathname === "/v1/chat/completions") {
     return { upstreamPath: "/v1/chat/completions", callType: "completion" };
   }
+
   if (pathname === "/v1/responses") {
     return { upstreamPath: "/v1/responses", callType: "responses" };
   }
+
   if (pathname === "/v1/completions") {
     return { upstreamPath: "/v1/completions", callType: "completion" };
   }
+
   if (pathname === "/v1/messages") {
     return { upstreamPath: "/v1/messages", callType: "messages" };
   }
+
   if (pathname.startsWith("/v1/")) {
     return { upstreamPath: pathname, callType: null };
   }
+  
   return null;
 }
 
 export { resolveConfig, resolvePort, loadConfigFile } from "./config.js";
 export { modelNeedsFix } from "./prefill-fix.js";
-export {
-  extractThinkingProps,
-  formatThinkingLog,
-} from "./thinking-restore.js";
+export { extractThinkingProps, formatThinkingLog } from "./thinking-restore.js";

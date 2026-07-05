@@ -444,6 +444,276 @@ test("e2e: caller Authorization is used as fallback when no upstreamApiKey", asy
   }
 });
 
+test("e2e: client anthropic-beta flags are merged with config flags", async () => {
+  let received: string | undefined;
+  const { proxy, upstream } = await boot(
+    {
+      upstreamHandler: async (req, res) => {
+        received = req.headers["anthropic-beta"] as string | undefined;
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      },
+    },
+    { upstreamHeaders: { "anthropic-beta": "config-a,config-b" } },
+  );
+
+  try {
+    const port = (proxy.address() as { port: number }).port;
+    await proxyRequest(port, {
+      path: "/v1/chat/completions",
+      headers: { "anthropic-beta": "client-x,client-y" },
+      body: { model: "gpt-4o", messages: [{ role: "user", content: "hi" }] },
+    });
+    const flags = (received ?? "").split(",").sort();
+    assert.deepEqual(
+      flags,
+      ["client-x", "client-y", "config-a", "config-b"],
+      `got: ${received}`,
+    );
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test("e2e: blacklisted client anthropic-beta flags are stripped", async () => {
+  let received: string | undefined;
+  const { proxy, upstream } = await boot(
+    {
+      upstreamHandler: async (req, res) => {
+        received = req.headers["anthropic-beta"] as string | undefined;
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      },
+    },
+    {
+      upstreamHeaders: { "anthropic-beta": "config-a" },
+      blacklistBetaFlags: ["bad-flag"],
+    },
+  );
+
+  try {
+    const port = (proxy.address() as { port: number }).port;
+    await proxyRequest(port, {
+      path: "/v1/chat/completions",
+      headers: { "anthropic-beta": "good-flag,bad-flag" },
+      body: { model: "gpt-4o", messages: [{ role: "user", content: "hi" }] },
+    });
+    const flags = (received ?? "").split(",").sort();
+    assert.deepEqual(flags, ["config-a", "good-flag"], `got: ${received}`);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test("e2e: blacklist does not strip config-provided beta flags", async () => {
+  let received: string | undefined;
+  const { proxy, upstream } = await boot(
+    {
+      upstreamHandler: async (req, res) => {
+        received = req.headers["anthropic-beta"] as string | undefined;
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      },
+    },
+    {
+      upstreamHeaders: { "anthropic-beta": "config-a,blocked-cfg" },
+      blacklistBetaFlags: ["blocked-cfg"],
+    },
+  );
+
+  try {
+    const port = (proxy.address() as { port: number }).port;
+    await proxyRequest(port, {
+      path: "/v1/chat/completions",
+      headers: { "anthropic-beta": "blocked-cfg,client-ok" },
+      body: { model: "gpt-4o", messages: [{ role: "user", content: "hi" }] },
+    });
+    const flags = (received ?? "").split(",").sort();
+    // config's "blocked-cfg" survives the blacklist; client's "blocked-cfg" is deduped.
+    assert.deepEqual(
+      flags,
+      ["blocked-cfg", "client-ok", "config-a"],
+      `got: ${received}`,
+    );
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test("e2e: duplicate anthropic-beta flags are de-duplicated", async () => {
+  let received: string | undefined;
+  const { proxy, upstream } = await boot(
+    {
+      upstreamHandler: async (req, res) => {
+        received = req.headers["anthropic-beta"] as string | undefined;
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      },
+    },
+    { upstreamHeaders: { "anthropic-beta": "shared,config-only" } },
+  );
+
+  try {
+    const port = (proxy.address() as { port: number }).port;
+    await proxyRequest(port, {
+      path: "/v1/chat/completions",
+      headers: { "anthropic-beta": "shared,client-only" },
+      body: { model: "gpt-4o", messages: [{ role: "user", content: "hi" }] },
+    });
+    const flags = (received ?? "").split(",");
+    assert.equal(
+      flags.filter((f) => f === "shared").length,
+      1,
+      `"shared" must appear exactly once, got: ${received}`,
+    );
+    assert.ok(flags.includes("config-only"));
+    assert.ok(flags.includes("client-only"));
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test("e2e: config beta flags used verbatim when client sends none", async () => {
+  let received: string | undefined;
+  const { proxy, upstream } = await boot(
+    {
+      upstreamHandler: async (req, res) => {
+        received = req.headers["anthropic-beta"] as string | undefined;
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      },
+    },
+    { upstreamHeaders: { "anthropic-beta": "config-a,config-b" } },
+  );
+
+  try {
+    const port = (proxy.address() as { port: number }).port;
+    await proxyRequest(port, {
+      path: "/v1/chat/completions",
+      body: { model: "gpt-4o", messages: [{ role: "user", content: "hi" }] },
+    });
+    const flags = (received ?? "").split(",").sort();
+    assert.deepEqual(flags, ["config-a", "config-b"], `got: ${received}`);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test("e2e: all client beta flags blacklisted leaves only config flags", async () => {
+  let received: string | undefined;
+  const { proxy, upstream } = await boot(
+    {
+      upstreamHandler: async (req, res) => {
+        received = req.headers["anthropic-beta"] as string | undefined;
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      },
+    },
+    {
+      upstreamHeaders: { "anthropic-beta": "config-a" },
+      blacklistBetaFlags: ["client-a", "client-b"],
+    },
+  );
+
+  try {
+    const port = (proxy.address() as { port: number }).port;
+    await proxyRequest(port, {
+      path: "/v1/chat/completions",
+      headers: { "anthropic-beta": "client-a,client-b" },
+      body: { model: "gpt-4o", messages: [{ role: "user", content: "hi" }] },
+    });
+    assert.equal(received, "config-a", `got: ${received}`);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test("e2e: client-supplied headers take precedence over config defaults", async () => {
+  let userAgent: string | undefined;
+  let anthropicVersion: string | undefined;
+  const { proxy, upstream } = await boot(
+    {
+      upstreamHandler: async (req, res) => {
+        userAgent = req.headers["user-agent"] as string | undefined;
+        anthropicVersion = req.headers["anthropic-version"] as
+          | string
+          | undefined;
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      },
+    },
+    {
+      upstreamHeaders: {
+        "user-agent": "config-default-agent",
+        "anthropic-version": "config-version",
+      },
+    },
+  );
+
+  try {
+    const port = (proxy.address() as { port: number }).port;
+    // Client supplies user-agent but NOT anthropic-version.
+    await proxyRequest(port, {
+      path: "/v1/chat/completions",
+      headers: { "user-agent": "my-custom-agent" },
+      body: { model: "gpt-4o", messages: [{ role: "user", content: "hi" }] },
+    });
+    // Client header wins.
+    assert.equal(
+      userAgent,
+      "my-custom-agent",
+      `client user-agent should win, got: ${userAgent}`,
+    );
+    // Missing client header falls back to config default.
+    assert.equal(
+      anthropicVersion,
+      "config-version",
+      `missing header should use default, got: ${anthropicVersion}`,
+    );
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test("e2e: config defaults used when client sends no custom headers", async () => {
+  let userAgent: string | undefined;
+  const { proxy, upstream } = await boot(
+    {
+      upstreamHandler: async (req, res) => {
+        userAgent = req.headers["user-agent"] as string | undefined;
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      },
+    },
+    {
+      upstreamHeaders: { "user-agent": "config-default-agent" },
+    },
+  );
+
+  try {
+    const port = (proxy.address() as { port: number }).port;
+    await proxyRequest(port, {
+      path: "/v1/chat/completions",
+      body: { model: "gpt-4o", messages: [{ role: "user", content: "hi" }] },
+    });
+    assert.equal(
+      userAgent,
+      "config-default-agent",
+      `default should be used when client omits header, got: ${userAgent}`,
+    );
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
 test("e2e: upstreamApiKey array keys are all selectable (distinct models)", async () => {
   const seen: string[] = [];
   const { proxy, upstream } = await boot(
@@ -526,9 +796,9 @@ test("e2e: different models learn independently", async () => {
       upstreamHandler: async (req, res) => {
         const chunks: Buffer[] = [];
         for await (const c of req) chunks.push(c as Buffer);
-        const parsed = JSON.parse(
-          Buffer.concat(chunks).toString() || "{}",
-        ) as { model?: string };
+        const parsed = JSON.parse(Buffer.concat(chunks).toString() || "{}") as {
+          model?: string;
+        };
         const m = parsed.model ?? "?";
         (byModel[m] ??= []).push(req.headers["authorization"] ?? "");
         res.writeHead(200, { "content-type": "application/json" });
@@ -598,7 +868,11 @@ test("e2e: keys rotate across retries within a single request", async () => {
     assert.equal(out.status, 200);
     assert.equal(hits, 3);
     // Three different keys should have been used (order is random)
-    assert.equal(new Set(seen).size, 3, "expected 3 distinct keys, got: " + seen.join(", "));
+    assert.equal(
+      new Set(seen).size,
+      3,
+      "expected 3 distinct keys, got: " + seen.join(", "),
+    );
   } finally {
     await close(proxy);
     await close(upstream);
@@ -858,6 +1132,304 @@ test("e2e: 401 is not retried when no upstreamApiKey is configured", async () =>
   }
 });
 
+test("e2e: sustained failures evict a learned model+key pair", async () => {
+  // With threshold=1 a single failure is enough to evict, making the test
+  // fully deterministic.
+  let phase = 1;
+  const seen: string[] = [];
+  const { proxy, upstream } = await boot(
+    {
+      upstreamHandler: (req, res) => {
+        const auth = req.headers["authorization"] ?? "";
+        seen.push(auth);
+        const isKeyA = auth === "Bearer key-a";
+        if (phase === 1) {
+          // Only key-a works so it alone gets learned.
+          if (isKeyA) {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: true }));
+          } else {
+            res.writeHead(500, { "content-type": "application/json" });
+            res.end(JSON.stringify({ error: "temp" }));
+          }
+          return;
+        }
+        // Phase 2+: key-a is now broken, key-b serves the failover.
+        if (isKeyA) {
+          res.writeHead(500, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: "temp" }));
+        } else {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ ok: true }));
+        }
+      },
+    },
+    {
+      upstreamApiKey: ["key-a", "key-b"],
+      retryIntervalMs: 5,
+      affinityFailThreshold: 1,
+    },
+  );
+
+  try {
+    const port = (proxy.address() as { port: number }).port;
+    const send = () =>
+      proxyRequest(port, {
+        path: "/v1/chat/completions",
+        body: { model: "gpt-4o", messages: [{ role: "user", content: "hi" }] },
+      });
+
+    // Phase 1: learn key-a for gpt-4o.
+    await send();
+
+    // Phase 2: key-a fails (evicted at threshold=1), key-b serves failover.
+    phase = 2;
+    seen.length = 0;
+    await send();
+    assert.ok(
+      seen.includes("Bearer key-a"),
+      "key-a should have been tried first (preferred) and failed",
+    );
+
+    // Phase 3: key-a must no longer be preferred — key-b is the only learned
+    // key, so it should be selected directly in a single attempt.
+    seen.length = 0;
+    await send();
+    assert.deepEqual(
+      seen,
+      ["Bearer key-b"],
+      `evicted key-a should not be preferred, got: ${seen.join(", ")}`,
+    );
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test("e2e: 429 rate-limit errors evict a learned model+key pair", async () => {
+  const warns: string[] = [];
+  const origWarn = console.warn;
+  console.warn = (...args: any[]) => warns.push(args.join(" "));
+  let phase = 1;
+  const { proxy, upstream } = await boot(
+    {
+      upstreamHandler: (req, res) => {
+        const auth = req.headers["authorization"] ?? "";
+        if (phase === 1) {
+          if (auth === "Bearer key-a") {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: true }));
+          } else {
+            res.writeHead(500, { "content-type": "application/json" });
+            res.end(JSON.stringify({ error: "temp" }));
+          }
+          return;
+        }
+        if (auth === "Bearer key-a") {
+          res.writeHead(429, {
+            "content-type": "application/json",
+            "retry-after": "120",
+          });
+          res.end(JSON.stringify({ error: "rate limited" }));
+        } else {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ ok: true }));
+        }
+      },
+    },
+    {
+      upstreamApiKey: ["key-a", "key-b"],
+      retryIntervalMs: 5,
+      affinityFailThreshold: 1,
+    },
+  );
+
+  try {
+    const port = (proxy.address() as { port: number }).port;
+    const send = () =>
+      proxyRequest(port, {
+        path: "/v1/chat/completions",
+        body: { model: "gpt-4o", messages: [{ role: "user", content: "hi" }] },
+      });
+
+    // Phase 1: learn key-a.
+    await send();
+    // Phase 2: key-a returns 429 — should be evicted immediately.
+    phase = 2;
+    await send();
+
+    const evicted = warns.find(
+      (l) => l.includes("evicted key=") && l.includes("model=gpt-4o"),
+    );
+    assert.ok(
+      evicted,
+      `expected an eviction warning for gpt-4o, got: ${warns.filter((w) => w.includes("evicted")).join(" | ")}`,
+    );
+  } finally {
+    console.warn = origWarn;
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test("e2e: transient failure below threshold does not evict", async () => {
+  // threshold=5: a single blip must NOT evict the pair.
+  let phase = 1;
+  const seen: string[] = [];
+  const { proxy, upstream } = await boot(
+    {
+      upstreamHandler: (req, res) => {
+        const auth = req.headers["authorization"] ?? "";
+        seen.push(auth);
+        const isKeyA = auth === "Bearer key-a";
+        if (phase === 1) {
+          res.writeHead(isKeyA ? 200 : 500, {
+            "content-type": "application/json",
+          });
+          res.end(
+            isKeyA
+              ? JSON.stringify({ ok: true })
+              : JSON.stringify({ error: "temp" }),
+          );
+          return;
+        }
+        if (phase === 2) {
+          // key-a blips once, key-b serves.
+          res.writeHead(isKeyA ? 500 : 200, {
+            "content-type": "application/json",
+          });
+          res.end(
+            isKeyA
+              ? JSON.stringify({ error: "temp" })
+              : JSON.stringify({ ok: true }),
+          );
+          return;
+        }
+        // Phase 3: both keys work again.
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      },
+    },
+    {
+      upstreamApiKey: ["key-a", "key-b"],
+      retryIntervalMs: 5,
+      affinityFailThreshold: 5,
+    },
+  );
+
+  try {
+    const port = (proxy.address() as { port: number }).port;
+    const send = () =>
+      proxyRequest(port, {
+        path: "/v1/chat/completions",
+        body: { model: "gpt-4o", messages: [{ role: "user", content: "hi" }] },
+      });
+
+    await send(); // phase 1: learn key-a
+    phase = 2;
+    await send(); // phase 2: key-a blips once (fails=1, not evicted)
+
+    // Phase 3: key-a should still be preferred (not evicted), so it should be
+    // selected at least once across several requests.
+    phase = 3;
+    seen.length = 0;
+    for (let i = 0; i < 20; i++) await send();
+    assert.ok(
+      seen.includes("Bearer key-a"),
+      "key-a should still be preferred after a single transient failure: " +
+        seen.join(", "),
+    );
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test("e2e: evicted pair re-learns after a clean success", async () => {
+  const logs: string[] = [];
+  const origLog = console.log;
+  console.log = (...args: any[]) => logs.push(args.join(" "));
+  let phase = 1;
+  const { proxy, upstream } = await boot(
+    {
+      upstreamHandler: (req, res) => {
+        const auth = req.headers["authorization"] ?? "";
+        const isKeyA = auth === "Bearer key-a";
+        if (phase === 1) {
+          res.writeHead(isKeyA ? 200 : 500, {
+            "content-type": "application/json",
+          });
+          res.end(
+            isKeyA
+              ? JSON.stringify({ ok: true })
+              : JSON.stringify({ error: "temp" }),
+          );
+          return;
+        }
+        if (phase === 2) {
+          res.writeHead(isKeyA ? 500 : 200, {
+            "content-type": "application/json",
+          });
+          res.end(
+            isKeyA
+              ? JSON.stringify({ error: "temp" })
+              : JSON.stringify({ ok: true }),
+          );
+          return;
+        }
+        // Phase 3: key-a works again, key-b broken — key-a must serve the
+        // failover and be re-learned.
+        res.writeHead(isKeyA ? 200 : 500, {
+          "content-type": "application/json",
+        });
+        res.end(
+          isKeyA
+            ? JSON.stringify({ ok: true })
+            : JSON.stringify({ error: "temp" }),
+        );
+      },
+    },
+    {
+      upstreamApiKey: ["key-a", "key-b"],
+      retryIntervalMs: 5,
+      affinityFailThreshold: 1,
+    },
+  );
+
+  try {
+    const port = (proxy.address() as { port: number }).port;
+    const send = () =>
+      proxyRequest(port, {
+        path: "/v1/chat/completions",
+        body: { model: "gpt-4o", messages: [{ role: "user", content: "hi" }] },
+      });
+
+    await send(); // phase 1: learn key-a
+    phase = 2;
+    await send(); // phase 2: evict key-a, learn key-b
+    // Count "learned" logs for gpt-4o so far (key-a in phase 1, key-b in phase 2).
+    const learnedBefore = logs.filter(
+      (l) => l.includes("learned") && l.includes("gpt-4o"),
+    ).length;
+
+    // Phase 3: key-a works again, key-b broken — key-a must serve the
+    // failover and be re-learned (only key-a can produce a new "learned").
+    phase = 3;
+    await send();
+    const learnedAfter = logs.filter(
+      (l) => l.includes("learned") && l.includes("gpt-4o"),
+    ).length;
+    assert.ok(
+      learnedAfter > learnedBefore,
+      "key-a should be re-learned after a clean success post-eviction",
+    );
+  } finally {
+    console.log = origLog;
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
 test("e2e: /v1/messages overwrites metadata and sets anthropic-version header", async () => {
   let captured: any;
   let sessionHeader: string | undefined;
@@ -1068,12 +1640,12 @@ test("e2e: 2xx with SSE error body is retried and ultimately succeeds", async ()
         if (hits < 2) {
           res.writeHead(200, { "content-type": "text/event-stream" });
           res.end(
-            "data: {\"error\":{\"message\":\"overloaded\",\"type\":\"overloaded_error\"}}\n\n",
+            'data: {"error":{"message":"overloaded","type":"overloaded_error"}}\n\n',
           );
           return;
         }
         res.writeHead(200, { "content-type": "text/event-stream" });
-        res.end("data: {\"id\":\"evt_1\",\"choices\":[]}\n\ndata: [DONE]\n");
+        res.end('data: {"id":"evt_1","choices":[]}\n\ndata: [DONE]\n');
       },
     },
     { retryAttempts: 3, retryIntervalMs: 5 },
@@ -1103,7 +1675,7 @@ test("e2e: 2xx with SSE error body is retried up to retryAttempts then returns 5
         hits++;
         res.writeHead(200, { "content-type": "text/event-stream" });
         res.end(
-          "data: {\"error\":{\"message\":\"overloaded\",\"type\":\"overloaded_error\"}}\n\n",
+          'data: {"error":{"message":"overloaded","type":"overloaded_error"}}\n\n',
         );
       },
     },
@@ -1235,7 +1807,10 @@ test("resolveConfig opts override config.json", () => {
 
 test("default upstreamHeaders are populated with dynamic versions", () => {
   const cfg = resolveConfig({ _skipFile: true });
-  assert.match(cfg.upstreamHeaders["user-agent"], /^claude-cli\/\d+\.\d+\.\d+ /);
+  assert.match(
+    cfg.upstreamHeaders["user-agent"],
+    /^claude-cli\/\d+\.\d+\.\d+ /,
+  );
   assert.match(
     cfg.upstreamHeaders["x-stainless-package-version"],
     /^\d+\.\d+\.\d+$/,
@@ -1263,7 +1838,10 @@ test("upstreamHeaders from opts override defaults", () => {
   });
   assert.equal(cfg.upstreamHeaders["x-app"], "custom");
   assert.equal(cfg.upstreamHeaders["x-stainless-os"], "Linux");
-  assert.match(cfg.upstreamHeaders["user-agent"], /^claude-cli\/\d+\.\d+\.\d+ /);
+  assert.match(
+    cfg.upstreamHeaders["user-agent"],
+    /^claude-cli\/\d+\.\d+\.\d+ /,
+  );
 });
 
 test("extractThinkingProps captures model and known thinking keys", () => {
@@ -1305,7 +1883,9 @@ test("formatThinkingLog serializes objects as JSON", () => {
 
 test("isStreamError detects a JSON object error body", () => {
   const reason = isStreamError(
-    JSON.stringify({ error: { message: "overloaded", type: "overloaded_error" } }),
+    JSON.stringify({
+      error: { message: "overloaded", type: "overloaded_error" },
+    }),
   );
   assert.equal(reason, "overloaded");
 });
@@ -1324,17 +1904,15 @@ test("isStreamError detects a type=error... body", () => {
 
 test("isStreamError detects an SSE data: line carrying an error", () => {
   const sse =
-    "data: {\"id\":\"evt_1\"}\n\n" +
-    "data: {\"error\":{\"message\":\"stream interrupted\",\"type\":\"server_error\"}}\n\n" +
+    'data: {"id":"evt_1"}\n\n' +
+    'data: {"error":{"message":"stream interrupted","type":"server_error"}}\n\n' +
     "data: [DONE]\n";
   const reason = isStreamError(sse);
   assert.equal(reason, "stream interrupted");
 });
 
 test("isStreamError returns null for a clean SSE stream", () => {
-  const sse =
-    "data: {\"id\":\"evt_1\",\"choices\":[]}\n\n" +
-    "data: [DONE]\n";
+  const sse = 'data: {"id":"evt_1","choices":[]}\n\n' + "data: [DONE]\n";
   assert.equal(isStreamError(sse), null);
 });
 
@@ -1342,13 +1920,11 @@ test("isStreamError returns null for empty or non-error body", () => {
   assert.equal(isStreamError(""), null);
   assert.equal(isStreamError("   "), null);
   assert.equal(isStreamError(JSON.stringify({ ok: true })), null);
-  assert.equal(isStreamError("data: {\"id\":\"evt_1\"}\n\n"), null);
+  assert.equal(isStreamError('data: {"id":"evt_1"}\n\n'), null);
 });
 
 test("isStreamError skips malformed SSE data lines without throwing", () => {
-  const sse =
-    "data: not-json\n\n" +
-    "data: {\"error\":\"boom\"}\n\n";
+  const sse = "data: not-json\n\n" + 'data: {"error":"boom"}\n\n';
   assert.equal(isStreamError(sse), "boom");
 });
 
