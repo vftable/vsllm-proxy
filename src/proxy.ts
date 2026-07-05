@@ -54,6 +54,19 @@ function maskKey(key: string): string {
   return `${key.slice(0, 8)}...${key.slice(-4)}`;
 }
 
+function extractModel(body: Buffer | null): string | null {
+  if (!body || body.length === 0) return null;
+  try {
+    const parsed = JSON.parse(body.toString("utf8")) as {
+      model?: unknown;
+    };
+    const model = parsed.model;
+    return typeof model === "string" && model.length > 0 ? model : null;
+  } catch {
+    return null;
+  }
+}
+
 function prettyBody(body: Buffer | string | null): string {
   if (!body) return "(empty)";
   const raw = typeof body === "string" ? Buffer.from(body, "utf8") : body;
@@ -316,6 +329,7 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
     key: k,
     keyId: maskKey(k),
     rateLimitedUntil: 0,
+    successModels: new Set<string>(),
   }));
 
   const upstreamAgent = config.upstreamBaseUrl.startsWith("https:")
@@ -330,11 +344,15 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
         maxFreeSockets: 32,
       });
 
-  function selectKey(tried: Set<number>): number {
+  function selectKey(tried: Set<number>, model: string | null): number {
     if (keyStates.length === 0) return 0;
     const now = Date.now();
 
-    const available = keyStates
+    const pick = (pool: number[]): number =>
+      pool[Math.floor(Math.random() * pool.length)];
+
+    // Fresh, usable keys: not yet tried, not disabled, not rate-limited.
+    const fresh = keyStates
       .map((_, i) => i)
       .filter(
         (i) =>
@@ -343,12 +361,21 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
           keyStates[i].rateLimitedUntil <= now,
       );
 
-    if (available.length === 1) return available[0];
-    if (available.length > 1) {
-      return available[Math.floor(Math.random() * available.length)];
+    if (fresh.length > 0) {
+      // Prefer keys that have already served this model successfully so we
+      // route to known-good pairs first; only fall back to unproven keys
+      // when no known-good key is available.
+      if (model) {
+        const preferred = fresh.filter((i) =>
+          keyStates[i].successModels?.has(model),
+        );
+        if (preferred.length > 0) return pick(preferred);
+      }
+      return pick(fresh);
     }
 
-    // No fresh keys — fall back to untried keys that aren't permanently bad.
+    // No fresh keys — fall back to untried keys that aren't permanently bad
+    // (may be rate-limited; choose the one whose cooldown expires soonest).
     const untried = keyStates
       .map((_, i) => i)
       .filter((i) => !tried.has(i) && !keyStates[i].authFailed);
@@ -366,10 +393,10 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
       .map((_, i) => i)
       .filter((i) => !keyStates[i].authFailed);
     if (nonAuthFailed.length > 0) {
-      return nonAuthFailed[Math.floor(Math.random() * nonAuthFailed.length)];
+      return pick(nonAuthFailed);
     }
 
-    return Math.floor(Math.random() * keyStates.length);
+    return pick(keyStates.map((_, i) => i));
   }
 
   function availableKeyIds(exclude?: number): string[] {
@@ -743,7 +770,7 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
               console.log(
                 `[vsllm-proxy] stream-end key=${keyId} ${reqMethod} ${upstreamPath} (${elapsed}s)`,
               );
-              finish({ ok: true, committed: true });
+              finish({ ok: true, committed: true, served: true });
               return;
             }
 
@@ -761,7 +788,7 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
 
             res.writeHead(status, fwdHeaders);
             res.end(resBody);
-            finish({ ok: true, committed: true });
+            finish({ ok: true, committed: true, served: true });
           });
         },
       );
@@ -809,6 +836,7 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
   ): Promise<void> {
     const tried = new Set<number>();
     let lastReason = "no attempts";
+    const model = extractModel(body);
     const maxAttempts =
       keyStates.length > 0
         ? Math.max(config.retryAttempts, keyStates.length)
@@ -817,7 +845,7 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       if (res.writableEnded || res.headersSent) return;
 
-      const keyIndex = selectKey(tried);
+      const keyIndex = selectKey(tried, model);
       tried.add(keyIndex);
 
       const result = await attemptOnce(
@@ -828,7 +856,20 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
         keyIndex,
         sessionId,
       );
-      if (result.ok) return;
+      if (result.ok) {
+        // Remember that this key successfully served this model so future
+        // requests for the same model prefer it over unproven keys.
+        if (result.served && model && keyStates.length > 0) {
+          const learned = keyStates[keyIndex].successModels;
+          if (learned && !learned.has(model)) {
+            learned.add(model);
+            console.log(
+              `[vsllm-proxy] learned key=${keyStates[keyIndex].keyId} serves model=${model}`,
+            );
+          }
+        }
+        return;
+      }
 
       lastReason = result.reason || lastReason;
 

@@ -444,7 +444,7 @@ test("e2e: caller Authorization is used as fallback when no upstreamApiKey", asy
   }
 });
 
-test("e2e: upstreamApiKey array uses all keys across requests", async () => {
+test("e2e: upstreamApiKey array keys are all selectable (distinct models)", async () => {
   const seen: string[] = [];
   const { proxy, upstream } = await boot(
     {
@@ -459,17 +459,110 @@ test("e2e: upstreamApiKey array uses all keys across requests", async () => {
 
   try {
     const port = (proxy.address() as { port: number }).port;
+    // A distinct model per request means no sticky learning pins traffic to
+    // a single key, so random selection should reach every key.
     for (let i = 0; i < 30; i++) {
       await proxyRequest(port, {
         path: "/v1/chat/completions",
-        body: { model: "gpt-4o", messages: [{ role: "user", content: "hi" }] },
+        body: {
+          model: `model-${i}`,
+          messages: [{ role: "user", content: "hi" }],
+        },
       });
     }
     const seenSet = new Set(seen);
     assert.ok(seenSet.has("Bearer key-a"), "key-a should be used");
     assert.ok(seenSet.has("Bearer key-b"), "key-b should be used");
     assert.ok(seenSet.has("Bearer key-c"), "key-c should be used");
-    assert.equal(seen.length, 30);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test("e2e: successful model+key pair is preferred on subsequent requests", async () => {
+  const seen: string[] = [];
+  const { proxy, upstream } = await boot(
+    {
+      upstreamHandler: async (req, res) => {
+        seen.push(req.headers["authorization"] ?? "");
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      },
+    },
+    { upstreamApiKey: ["key-a", "key-b", "key-c"] },
+  );
+
+  try {
+    const port = (proxy.address() as { port: number }).port;
+    const reqBody = {
+      path: "/v1/chat/completions",
+      body: { model: "gpt-4o", messages: [{ role: "user", content: "hi" }] },
+    };
+    // First request picks a key at random and learns it for this model.
+    await proxyRequest(port, reqBody);
+    const learned = seen[0];
+    assert.ok(learned, "first request should have hit a key");
+
+    // All subsequent requests for the same model must prefer the learned key.
+    seen.length = 0;
+    for (let i = 0; i < 15; i++) {
+      await proxyRequest(port, reqBody);
+    }
+    assert.ok(
+      seen.every((s) => s === learned),
+      `expected all follow-up requests to use learned key ${learned}, got: ${seen.join(", ")}`,
+    );
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test("e2e: different models learn independently", async () => {
+  const byModel: Record<string, string[]> = {};
+  const { proxy, upstream } = await boot(
+    {
+      upstreamHandler: async (req, res) => {
+        const chunks: Buffer[] = [];
+        for await (const c of req) chunks.push(c as Buffer);
+        const parsed = JSON.parse(
+          Buffer.concat(chunks).toString() || "{}",
+        ) as { model?: string };
+        const m = parsed.model ?? "?";
+        (byModel[m] ??= []).push(req.headers["authorization"] ?? "");
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      },
+    },
+    { upstreamApiKey: ["key-a", "key-b"] },
+  );
+
+  try {
+    const port = (proxy.address() as { port: number }).port;
+    const send = (model: string) =>
+      proxyRequest(port, {
+        path: "/v1/chat/completions",
+        body: { model, messages: [{ role: "user", content: "hi" }] },
+      });
+
+    // Seed each model so it learns a key, then verify it sticks to that key.
+    await send("alpha");
+    await send("beta");
+    const alphaKey = byModel["alpha"][0];
+    const betaKey = byModel["beta"][0];
+    for (let i = 0; i < 10; i++) {
+      await send("alpha");
+      await send("beta");
+    }
+    assert.ok(
+      byModel["alpha"].every((k) => k === alphaKey),
+      `alpha should stick to ${alphaKey}`,
+    );
+    assert.ok(
+      byModel["beta"].every((k) => k === betaKey),
+      `beta should stick to ${betaKey}`,
+    );
   } finally {
     await close(proxy);
     await close(upstream);
@@ -702,16 +795,18 @@ test("e2e: auth-failed key is skipped on subsequent requests", async () => {
 
   try {
     const port = (proxy.address() as { port: number }).port;
-    const reqBody = {
-      path: "/v1/chat/completions",
-      body: { model: "gpt-4o", messages: [{ role: "user", content: "hi" }] },
-    };
 
-    // Phase 1: send requests until key-a is hit (random selection means it
-    // may not be picked on the first try). Once hit, it gets disabled.
+    // Phase 1: send requests with distinct models (so sticky learning can't
+    // pin traffic to one good key) until key-a is hit and disabled.
     for (let i = 0; i < 30; i++) {
       seen.length = 0;
-      await proxyRequest(port, reqBody);
+      await proxyRequest(port, {
+        path: "/v1/chat/completions",
+        body: {
+          model: `probe-${i}`,
+          messages: [{ role: "user", content: "hi" }],
+        },
+      });
       if (seen.includes("Bearer key-a")) break;
     }
     assert.ok(
@@ -719,9 +814,12 @@ test("e2e: auth-failed key is skipped on subsequent requests", async () => {
       "phase 1 should have triggered key-a's 401",
     );
 
-    // Phase 2: key-a is now disabled — it must not be selected again.
+    // Phase 2: key-a is now globally disabled — it must not be selected again.
     seen.length = 0;
-    await proxyRequest(port, reqBody);
+    await proxyRequest(port, {
+      path: "/v1/chat/completions",
+      body: { model: "gpt-4o", messages: [{ role: "user", content: "hi" }] },
+    });
     assert.ok(
       !seen.includes("Bearer key-a"),
       "auth-failed key-a should not be used: " + seen.join(", "),

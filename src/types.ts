@@ -24,6 +24,7 @@ export interface AttemptResult {
   reason?: string;
   rateLimitMs?: number;
   authFailed?: boolean;
+  served?: boolean;
 }
 
 export interface KeyState {
@@ -31,6 +32,7 @@ export interface KeyState {
   keyId: string;
   rateLimitedUntil: number;
   authFailed?: boolean;
+  successModels?: Set<string>;
 }
 
 export interface UpstreamErrorResponse {
