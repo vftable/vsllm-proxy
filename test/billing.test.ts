@@ -27,6 +27,7 @@ const ENV_KEYS = [
   "PROXY_CC_SCRUB_MESSAGES",
   "PROXY_CC_NORMALIZE_TOOLS",
   "PROXY_CC_DECOY_TOOLS",
+  "PROXY_CC_THINKING_MODE",
 ] as const;
 
 const snapshot: Record<string, string | undefined> = {};
@@ -204,7 +205,7 @@ test("stripExistingFingerprint drops identity and billing blocks", () => {
   );
 });
 
-test("buildSystemArray orders [billing, identity, ...cleaned] and dedups identity", () => {
+test("buildSystemArray orders [billing, identity, ...cleaned] and dedups identity (4.5+ model)", () => {
   const billing = buildBillingBlock(
     "cc_version=x; cc_entrypoint=cli; cch=00000;",
   );
@@ -214,6 +215,7 @@ test("buildSystemArray orders [billing, identity, ...cleaned] and dedups identit
       { type: "text", text: "Original", cache_control: { type: "ephemeral" } },
     ],
     billing,
+    "claude-sonnet-4-6",
   );
   assert.equal(sys.length, 3);
   assert.equal(sys[0], billing);
@@ -224,6 +226,32 @@ test("buildSystemArray orders [billing, identity, ...cleaned] and dedups identit
     cache_control: { type: "ephemeral" },
   });
 });
+
+/*
+test("buildSystemArray omits the identity block for a pre-4.6 / non-Claude / missing model", () => {
+  const billing = buildBillingBlock(
+    "cc_version=x; cc_entrypoint=cli; cch=00000;",
+  );
+  for (const model of ["claude-sonnet-4-5", "gpt-4o", undefined]) {
+    const sys = buildSystemArray(
+      [
+        { type: "text", text: CLAUDE_CODE_IDENTITY_TEXT },
+        { type: "text", text: "Original" },
+      ],
+      billing,
+      model,
+    );
+    // Identity is stripped from the input AND not re-injected → [billing, Original].
+    assert.equal(sys.length, 2, `model=${model}`);
+    assert.equal(sys[0], billing);
+    assert.deepEqual(sys[1], { type: "text", text: "Original" });
+    assert.ok(
+      !sys.some((b) => b.text === CLAUDE_CODE_IDENTITY_TEXT),
+      `identity must be absent for model=${model}`,
+    );
+  }
+});
+*/
 
 // ---------------------------------------------------------------------------
 // buildFinalBody — deterministic key order
@@ -335,8 +363,9 @@ test("applyAnthropicBilling returns a well-formed header value", () => {
   assert.ok(!/cch=00000;/.test(header), "cch must not be the placeholder");
 });
 
-test("applyAnthropicBilling rebuilds system[] as [billing, identity, ...]", () => {
+test("applyAnthropicBilling rebuilds system[] as [billing, identity, ...] for a 4.6+ model", () => {
   const { body, header } = applyAnthropicBilling({
+    model: "claude-sonnet-4-6",
     messages: [{ role: "user", content: "Hello" }],
   });
   const sys = body.system as Array<{ type: string; text: string }>;
@@ -345,8 +374,27 @@ test("applyAnthropicBilling rebuilds system[] as [billing, identity, ...]", () =
   assert.deepEqual(sys[1], { type: "text", text: CLAUDE_CODE_IDENTITY_TEXT });
 });
 
+/*
+test("applyAnthropicBilling omits the identity block for a pre-4.6 model", () => {
+  const { body } = applyAnthropicBilling({
+    model: "claude-sonnet-4-5",
+    system: "Original system prompt",
+    messages: [{ role: "user", content: "Hello" }],
+  });
+  const sys = body.system as Array<{ type: string; text: string }>;
+  // [billing, Original] — no identity block.
+  assert.ok(sys[0].text.startsWith("x-anthropic-billing-header:"));
+  assert.equal(sys[1].text, "Original system prompt");
+  assert.ok(
+    !sys.some((b) => b.text === CLAUDE_CODE_IDENTITY_TEXT),
+    "identity must be absent for a 4.5 model",
+  );
+});
+*/
+
 test("applyAnthropicBilling preserves original system blocks after identity", () => {
   const { body } = applyAnthropicBilling({
+    model: "claude-sonnet-4-6",
     system: "Original system prompt",
     messages: [{ role: "user", content: "Hello" }],
   });
@@ -359,6 +407,7 @@ test("applyAnthropicBilling preserves original system blocks after identity", ()
 
 test("applyAnthropicBilling preserves cache_control on non-identity original blocks", () => {
   const { body } = applyAnthropicBilling({
+    model: "claude-sonnet-4-6",
     system: [
       {
         type: "text",
@@ -379,6 +428,7 @@ test("applyAnthropicBilling preserves cache_control on non-identity original blo
 
 test("applyAnthropicBilling does not duplicate an existing identity block", () => {
   const { body } = applyAnthropicBilling({
+    model: "claude-sonnet-4-6",
     system: [{ type: "text", text: CLAUDE_CODE_IDENTITY_TEXT }],
     messages: [{ role: "user", content: "Hello" }],
   });
@@ -407,8 +457,11 @@ test("applyAnthropicBilling derives the reference version suffix for a known mes
 });
 
 test("applyAnthropicBilling cch is invariant to model/max_tokens (preimage transform)", () => {
+  // Both models are 4.6+ so the identity block is present in each — the
+  // preimage blanks the model value, so only cross-4.5-boundary identity
+  // differences (covered separately) would perturb cch, not the model string.
   const a = applyAnthropicBilling({
-    model: "claude-sonnet-4-20250514",
+    model: "claude-sonnet-4-6",
     max_tokens: 1024,
     messages: [{ role: "user", content: "Hello world" }],
   }).header;
@@ -726,6 +779,78 @@ test("applyAnthropicBilling strips thinking blocks before sending", () => {
   assert.ok(allBlocks.includes('"text"'), "text blocks must be preserved");
 });
 
+test("PROXY_CC_THINKING_MODE=text converts thinking blocks to signature-free text", () => {
+  process.env["PROXY_CC_THINKING_MODE"] = "text";
+  const { body } = applyAnthropicBilling({
+    system: "You are Claude Code.",
+    messages: [
+      {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "prior reasoning", signature: "sig" },
+          { type: "text", text: "ok" },
+        ],
+      },
+      { role: "user", content: "more" },
+    ],
+  });
+  const assistant = (body.messages as Array<{ content: unknown }>)[0]!;
+  const content = assistant.content as Array<Record<string, unknown>>;
+  // The reasoning prose survives, but as a text block with no signature — so it
+  // can't be rejected as an account-bound thinking signature.
+  assert.deepEqual(content[0], { type: "text", text: "prior reasoning" });
+  const serialized = JSON.stringify(body.messages);
+  assert.ok(
+    !serialized.includes('"thinking"'),
+    "no thinking block type remains",
+  );
+  assert.ok(!serialized.includes('"signature"'), "no signature remains");
+});
+
+test("thinking mode defaults to text (no PROXY_CC_THINKING_MODE) — prose preserved", () => {
+  const { body } = applyAnthropicBilling({
+    system: "You are Claude Code.",
+    messages: [
+      {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "prior reasoning", signature: "sig" },
+          { type: "text", text: "ok" },
+        ],
+      },
+    ],
+  });
+  const serialized = JSON.stringify(body.messages);
+  assert.ok(!serialized.includes('"thinking"'), "thinking block type removed");
+  assert.ok(!serialized.includes('"signature"'), "signature removed");
+  assert.ok(
+    serialized.includes("prior reasoning"),
+    "prose is converted to text by default, not dropped",
+  );
+});
+
+test("PROXY_CC_THINKING_MODE=strip drops thinking blocks (prose not preserved)", () => {
+  process.env["PROXY_CC_THINKING_MODE"] = "strip";
+  const { body } = applyAnthropicBilling({
+    system: "You are Claude Code.",
+    messages: [
+      {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "prior reasoning", signature: "sig" },
+          { type: "text", text: "ok" },
+        ],
+      },
+    ],
+  });
+  const serialized = JSON.stringify(body.messages);
+  assert.ok(!serialized.includes('"thinking"'), "thinking removed");
+  assert.ok(
+    !serialized.includes("prior reasoning"),
+    "prose is dropped, not converted, in strip mode",
+  );
+});
+
 test("applyAnthropicBilling dedups tools that collide after renaming", () => {
   const { body } = applyAnthropicBilling({
     system: "You are Claude Code.",
@@ -968,6 +1093,7 @@ test("a client-supplied PascalCase tool overrides its CC stub (client definition
 
 test("applyAnthropicBilling preserves system[] order [billing, identity, scrubbed...]", () => {
   const { body } = applyAnthropicBilling({
+    model: "claude-sonnet-4-6",
     system: "Workspace root folder: /foo",
     messages: [{ role: "user", content: "Hi" }],
   });

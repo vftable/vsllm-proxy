@@ -1,17 +1,12 @@
 import type { PrefillBody } from "./types.js";
+import { isModelPost45, POST_45_RE_EXPORT } from "./model-version.js";
 
-// Models that require the prefill auto-fix (a trailing assistant turn must be
-// followed by a synthetic user "continue" turn). Only `claude-` models ever
-// match — non-Claude models (gpt-*, gemini-*, ollama, ...) are never touched.
-//
-//   - claude-{sonnet,opus,haiku}-4-<N>   where N is 6-9 or two+ digits (4.6+)
-//   - claude-{sonnet,opus,haiku}-<N>     where N is 5-9 or two+ digits (5+)
-//   - claude-fable / claude-mythos       (any version)
-const NO_PREFILL_RE =
-  /claude-(?:sonnet|opus|haiku)-4-([6-9]|\d{2,})(?:-|$)|claude-(?:sonnet|opus|haiku)-([5-9]|\d{2,})(?:-|$)|claude-(?:fable|mythos)/i;
-
+// The prefill auto-fix (a trailing assistant turn must be followed by a
+// synthetic user "continue" turn) applies to every Claude model newer than 4.5.
+// The version gate lives in ./model-version.js (shared with the Claude Code
+// identity injection); `modelNeedsFix` is the prefill-facing alias.
 export function modelNeedsFix(model: unknown): boolean {
-  return typeof model === "string" && NO_PREFILL_RE.test(model);
+  return isModelPost45(model);
 }
 
 export function extractToolUseIds(content: unknown): string[] {
@@ -74,4 +69,4 @@ export function applyPrefillFix(
   return true;
 }
 
-export const NO_PREFILL_RE_EXPORT = NO_PREFILL_RE;
+export const NO_PREFILL_RE_EXPORT = POST_45_RE_EXPORT;

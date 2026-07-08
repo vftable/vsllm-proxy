@@ -234,7 +234,8 @@ function maybeRenameToolName(value: unknown): string | undefined {
   const mapped =
     OPENCODE_TOOL_NAME_MAP.get(value) ?? OHMYPI_TOOL_NAME_MAP.get(value);
   if (mapped !== undefined) return mapped;
-  if (value.toLowerCase().includes("mcp")) return value.startsWith("mcp__") ? undefined : `mcp__${value}`;
+  if (value.toLowerCase().includes("mcp"))
+    return value.startsWith("mcp__") ? undefined : `mcp__${value}`;
   return toPascalCase(value);
 }
 

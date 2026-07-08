@@ -45,7 +45,8 @@ import {
   ensureCcDecoyTools,
   normalizeToolNames,
 } from "./tool-normalization.js";
-import { stripThinkingBlocks } from "./thinking-strip.js";
+import { stripThinkingBlocks, thinkingBlocksToText } from "./thinking-strip.js";
+import { isModelPost45 } from "./model-version.js";
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -223,14 +224,32 @@ export function stripExistingFingerprint(blocks: SystemBlock[]): SystemBlock[] {
 
 /**
  * Build the final `system[]` array in the order real Claude Code emits:
- *   system[0] = billing header block (NO cache_control — rotates per request)
- *   system[1] = identity block (NO cache_control — matches plugin wire format)
- *   system[2..] = original blocks (cache_control preserved if present)
+ *   system[0]  = billing header block (NO cache_control — rotates per request)
+ *   system[1]  = identity block (NO cache_control — matches plugin wire format),
+ *               ONLY for Claude models newer than 4.5 (see below)
+ *   system[..] = original blocks (cache_control preserved if present)
+ *
+ * Anthropic requires the exact Claude Code identity string as `system[0]` for
+ * OAuth accounts only on Sonnet/Opus 4.6+ (Haiku is exempt; 4.5 and older
+ * predate the requirement). Injecting it for a model that doesn't expect it is
+ * a needless fingerprint, so identity is gated on the same "over 4.5" version
+ * check as the prefill fix ({@link isModelPost45}). When `model` is older or
+ * non-Claude, the identity block is omitted and the array is
+ * `[billing, ...cleaned]`.
  */
 export function buildSystemArray(
   rawSystem: unknown,
   billingBlock: SystemBlock,
+  model?: unknown,
 ): SystemBlock[] {
+  const cleaned = stripExistingFingerprint(normalizeSystemBlocks(rawSystem));
+
+  /*
+  if (!isModelPost45(model)) {
+    return [billingBlock, ...cleaned];
+  }
+  */
+ 
   // The identity block is emitted WITHOUT cache_control to match Claude Code's
   // wire format byte-for-byte (verified by the plugin's plugin.spec.ts). Any
   // extra field here would alter the cch preimage and diverge from upstream.
@@ -238,7 +257,6 @@ export function buildSystemArray(
     type: "text",
     text: CLAUDE_CODE_IDENTITY_TEXT,
   };
-  const cleaned = stripExistingFingerprint(normalizeSystemBlocks(rawSystem));
   return [billingBlock, identity, ...cleaned];
 }
 
@@ -359,6 +377,13 @@ function readEnvFlag(name: string, defaultValue: boolean): boolean {
   return v !== "false" && v !== "0" && v !== "no" && v !== "off";
 }
 
+/** Read PROXY_CC_THINKING_MODE; only "strip" opts out of conversion (default text). */
+function readThinkingMode(): ThinkingMode {
+  return process.env["PROXY_CC_THINKING_MODE"]?.trim().toLowerCase() === "strip"
+    ? "strip"
+    : "text";
+}
+
 /**
  * Apply a body transform, returning the input unchanged if it throws. Each
  * pipeline stage (scrub → normalize → decoy) degrades gracefully to its
@@ -375,10 +400,20 @@ function applyTransform(
   }
 }
 
+/**
+ * How to handle assistant `thinking` blocks whose account-bound `signature`
+ * would be rejected when replayed against a different upstream key.
+ *   - "text": rewrite to signature-free `text` blocks (default; preserves the
+ *     reasoning prose across an account switch).
+ *   - "strip": drop the blocks entirely (loses reasoning context).
+ */
+export type ThinkingMode = "strip" | "text";
+
 export interface ApplyAnthropicBillingOptions {
   scrubMessages?: boolean;
   normalizeTools?: boolean;
   decoyTools?: boolean;
+  thinkingMode?: ThinkingMode;
 }
 
 export interface AnthropicBillingResult {
@@ -416,6 +451,9 @@ export interface AnthropicBillingResult {
  *                             still resolves against the retained decoy, so
  *                             injection is safe to leave on. Set false only to
  *                             opt out entirely.)
+ *   PROXY_CC_THINKING_MODE  — how to handle account-bound `thinking` blocks:
+ *                             "text" (default, rewrite to signature-free text
+ *                             blocks, preserving reasoning) or "strip" (drop them).
  */
 export function applyAnthropicBilling(
   requestBody: Readonly<Record<string, unknown>>,
@@ -427,14 +465,17 @@ export function applyAnthropicBilling(
     opts.normalizeTools ?? readEnvFlag("PROXY_CC_NORMALIZE_TOOLS", true);
   const decoyTools =
     opts.decoyTools ?? readEnvFlag("PROXY_CC_DECOY_TOOLS", true);
+  const thinkingMode = opts.thinkingMode ?? readThinkingMode();
 
-  // 1. Strip thinking → scrub → normalize → decoy. Each stage degrades to its
-  //    predecessor on failure. Thinking blocks are dropped first because their
-  //    signature is account-bound and rejected when replayed across keys; decoys
-  //    run last (before the cch build so the attested body matches the sent body).
+  // 1. Normalize thinking → scrub → normalize → decoy. Each stage degrades to
+  //    its predecessor on failure. Thinking blocks are handled first because
+  //    their signature is account-bound and rejected when replayed across keys
+  //    ("strip" drops them; "text" rewrites to signature-free text blocks);
+  //    decoys run last (before the cch build so the attested body matches the
+  //    sent body).
   let bodyForSigning: Readonly<Record<string, unknown>> = applyTransform(
     requestBody,
-    stripThinkingBlocks,
+    thinkingMode === "text" ? thinkingBlocksToText : stripThinkingBlocks,
   );
   bodyForSigning = applyTransform(bodyForSigning, (b) =>
     scrubAnchorsInPlace(b, { scrubMessages }),
@@ -465,6 +506,7 @@ export function applyAnthropicBilling(
   const placeholderSystemArray = buildSystemArray(
     systemSource,
     placeholderBillingBlock,
+    bodyForSigning["model"],
   );
   const placeholderBody = buildFinalBody(
     bodyForSigning,
