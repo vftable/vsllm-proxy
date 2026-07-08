@@ -231,6 +231,7 @@ function renameToolUseInMessage(m: unknown): unknown {
  */
 function maybeRenameToolName(value: unknown): string | undefined {
   if (typeof value !== "string" || value === "") return undefined;
+  console.log("maybeRenameToolName", value);
   const mapped =
     OPENCODE_TOOL_NAME_MAP.get(value) ?? OHMYPI_TOOL_NAME_MAP.get(value);
   if (mapped !== undefined) return mapped;
