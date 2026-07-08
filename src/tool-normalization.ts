@@ -84,6 +84,13 @@ function renameToolDefinition(
 ): unknown {
   if (typeof t !== "object" || t === null || Array.isArray(t)) return t;
   const td = { ...(t as Record<string, unknown>) };
+  // Server / built-in tools carry a `type` that is NOT `custom` (e.g.
+  // `web_search_20250305`, `computer_20250124`). Their `name` is fixed by the
+  // schema (`web_search` for the web search tool) and renaming it triggers
+  // `tools.N.<type>.name: Input should be '<expected>'` (HTTP 400). Only the
+  // standard `{name, description, input_schema}` user-defined tools (no `type`)
+  // are renamed.
+  if (isServerTool(td)) return td;
   const original = td["name"];
   const renamed = maybeRenameToolName(original);
   if (renamed !== undefined) {
@@ -97,6 +104,17 @@ function renameToolDefinition(
     }
   }
   return td;
+}
+
+/**
+ * A tool is a server/built-in tool when it carries a `type` field other than
+ * `custom`. Built-in tool types include `web_search_*`, `computer_*`,
+ * `bash_20250124`, `text_editor_*`, `code_execution_*`, etc. — all of which
+ * mandate a specific fixed `name` and must be passed through verbatim.
+ */
+function isServerTool(td: Record<string, unknown>): boolean {
+  const type = td["type"];
+  return typeof type === "string" && type !== "custom";
 }
 
 function renameToolUseInMessage(m: unknown): unknown {

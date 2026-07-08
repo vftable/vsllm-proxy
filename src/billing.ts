@@ -45,6 +45,7 @@ import {
   ensureCcDecoyTools,
   normalizeToolNames,
 } from "./tool-normalization.js";
+import { stripThinkingBlocks } from "./thinking-strip.js";
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -420,12 +421,16 @@ export function applyAnthropicBilling(
   const decoyTools =
     opts.decoyTools ?? readEnvFlag("PROXY_CC_DECOY_TOOLS", true);
 
-  // 1. Scrub → normalize → decoy. Each stage degrades to its predecessor on
-  //    failure. Decoys run before the cch build so the attested body matches
-  //    the body actually sent upstream.
+  // 1. Strip thinking → scrub → normalize → decoy. Each stage degrades to its
+  //    predecessor on failure. Thinking blocks are dropped first because their
+  //    signature is account-bound and rejected when replayed across keys; decoys
+  //    run last (before the cch build so the attested body matches the sent body).
   let bodyForSigning: Readonly<Record<string, unknown>> = applyTransform(
     requestBody,
-    (b) => scrubAnchorsInPlace(b, { scrubMessages }),
+    stripThinkingBlocks,
+  );
+  bodyForSigning = applyTransform(bodyForSigning, (b) =>
+    scrubAnchorsInPlace(b, { scrubMessages }),
   );
   let toolRenameMap = new Map<string, string>();
   if (normalizeTools) {

@@ -578,6 +578,71 @@ test("applyAnthropicBilling leaves mcp_ tool names untouched", () => {
   assert.ok(names.includes("mcp__github__create_issue"));
 });
 
+test("applyAnthropicBilling leaves server/built-in tools verbatim (fixed name)", () => {
+  // Anthropic mandates name='web_search' for a type='web_search_*' tool.
+  // Renaming it triggers `tools.N.<type>.name: Input should be 'web_search'`.
+  const { body } = applyAnthropicBilling({
+    system: "You are Claude Code.",
+    messages: [{ role: "user", content: "Hi" }],
+    tools: [
+      {
+        type: "web_search_20250305",
+        name: "web_search",
+        max_uses: 5,
+      } as unknown as Record<string, unknown>,
+      {
+        type: "computer_20250124",
+        name: "computer",
+        display_width_px: 1024,
+        display_height_px: 768,
+      } as unknown as Record<string, unknown>,
+    ],
+  });
+  const tools = body.tools as Array<{ name: string; type?: string }>;
+  const ws = tools.find((t) => t.type === "web_search_20250305")!;
+  assert.equal(ws.name, "web_search");
+  const comp = tools.find((t) => t.type === "computer_20250124")!;
+  assert.equal(comp.name, "computer");
+});
+
+test("applyAnthropicBilling still renames a type:custom tool like a normal one", () => {
+  const { body } = applyAnthropicBilling({
+    system: "You are Claude Code.",
+    messages: [{ role: "user", content: "Hi" }],
+    tools: [
+      {
+        type: "custom",
+        name: "get_user",
+        input_schema: { type: "object" },
+      } as unknown as Record<string, unknown>,
+    ],
+  });
+  const tools = body.tools as Array<{ name: string }>;
+  assert.ok(tools.some((t) => t.name === "GetUser"));
+});
+
+test("applyAnthropicBilling strips thinking blocks before sending", () => {
+  const { body } = applyAnthropicBilling({
+    system: "You are Claude Code.",
+    messages: [
+      {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "r", signature: "sig" },
+          { type: "text", text: "ok" },
+        ],
+      },
+      { role: "user", content: "more" },
+    ],
+  });
+  const allBlocks = JSON.stringify(body.messages);
+  assert.ok(
+    !allBlocks.includes('"thinking"'),
+    "thinking blocks must be stripped",
+  );
+  assert.ok(allBlocks.includes('"text"'), "text blocks must be preserved");
+});
+
 test("applyAnthropicBilling dedups tools that collide after renaming", () => {
   const { body } = applyAnthropicBilling({
     system: "You are Claude Code.",
