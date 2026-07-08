@@ -19,6 +19,7 @@ import {
   stripExistingFingerprint,
   withBetaQuery,
 } from "../src/billing.js";
+import { CC_TOOL_NAMES } from "../src/tool-normalization.js";
 
 const ENV_KEYS = [
   "PROXY_CC_VERSION",
@@ -564,6 +565,85 @@ test("applyAnthropicBilling PascalCases arbitrary non-mcp_ tool names", () => {
   assert.ok(names.includes("CamelCaseThing"));
 });
 
+test("applyAnthropicBilling maps ohmypi tool names to CC-native names", () => {
+  // ohmypi's snake_case/lowercase builtins map to their closest Claude Code
+  // native tool via OHMYPI_TOOL_NAME_MAP (semantic aliases the algorithmic
+  // PascalCaser can't infer).
+  const { body } = applyAnthropicBilling({
+    system: "You are Claude Code.",
+    messages: [{ role: "user", content: "Hi" }],
+    tools: [
+      { name: "ask", description: "d", input_schema: { type: "object" } },
+      { name: "task", description: "d", input_schema: { type: "object" } },
+      { name: "todo", description: "d", input_schema: { type: "object" } },
+      {
+        name: "manage_skill",
+        description: "d",
+        input_schema: { type: "object" },
+      },
+      {
+        name: "web_search",
+        description: "d",
+        input_schema: { type: "object" },
+      },
+    ],
+  });
+  const names = (body.tools as Array<{ name: string }>).map((t) => t.name);
+  assert.ok(names.includes("AskUserQuestion"), `got: ${names.join(",")}`);
+  assert.ok(names.includes("Agent"), `got: ${names.join(",")}`);
+  assert.ok(names.includes("TaskCreate"), `got: ${names.join(",")}`);
+  assert.ok(names.includes("Skill"), `got: ${names.join(",")}`);
+  assert.ok(names.includes("WebSearch"), `got: ${names.join(",")}`);
+  // No leaked non-CC PascalCase spellings.
+  for (const leaked of ["Ask", "Task", "Todo", "ManageSkill"]) {
+    assert.ok(!names.includes(leaked), `must not leak ${leaked}`);
+  }
+});
+
+test("applyAnthropicBilling cases ohmypi acronym-only extras (SSH/IRC/…)", () => {
+  // Outliers with no CC counterpart stay as extras but keep proper acronym
+  // casing the algorithmic pass would otherwise mangle (Ssh/Irc/Github/Lsp).
+  const { body } = applyAnthropicBilling({
+    system: "You are Claude Code.",
+    messages: [{ role: "user", content: "Hi" }],
+    tools: [
+      { name: "ssh", description: "d", input_schema: { type: "object" } },
+      { name: "irc", description: "d", input_schema: { type: "object" } },
+      { name: "github", description: "d", input_schema: { type: "object" } },
+      { name: "lsp", description: "d", input_schema: { type: "object" } },
+    ],
+  });
+  const names = (body.tools as Array<{ name: string }>).map((t) => t.name);
+  assert.ok(names.includes("SSH"), `got: ${names.join(",")}`);
+  assert.ok(names.includes("IRC"));
+  assert.ok(names.includes("GitHub"));
+  assert.ok(names.includes("LSP"));
+});
+
+test("applyAnthropicBilling passes Claude Code native tool names through as-is", () => {
+  // A genuine Claude Code client already sends PascalCase native names. They
+  // must survive normalization byte-for-byte (the override maps are keyed by
+  // the lowercase client spelling, so a CC name misses them and lands on the
+  // idempotent PascalCaser).
+  const ccTools = ["Read", "Bash", "Edit", "TaskCreate", "WebSearch"];
+  const { body } = applyAnthropicBilling({
+    system: "You are Claude Code.",
+    messages: [{ role: "user", content: "Hi" }],
+    tools: ccTools.map((name) => ({
+      name,
+      description: "d",
+      input_schema: { type: "object" },
+    })),
+    tool_choice: { type: "tool", name: "TaskCreate" },
+  });
+  const names = (body.tools as Array<{ name: string }>).map((t) => t.name);
+  for (const name of ccTools) {
+    assert.ok(names.includes(name), `CC native ${name} must pass through`);
+  }
+  const choice = body.tool_choice as { name: string };
+  assert.equal(choice.name, "TaskCreate", "CC tool_choice must be untouched");
+});
+
 test("applyAnthropicBilling leaves mcp_ tool names untouched", () => {
   const { body } = applyAnthropicBilling({
     system: "You are Claude Code.",
@@ -737,17 +817,73 @@ test("applyAnthropicBilling injects decoys for every missing CC native tool", ()
   });
   const tools = body.tools as Array<{ name: string; description: string }>;
   const names = new Set(tools.map((t) => t.name));
-  // The supplied `Read` (renamed) is kept exactly once and NOT overwritten.
+  // The supplied `read` (PascalCased to `Read`) OVERRIDES the CC `Read` slot —
+  // the client's real definition wins, the stub is NOT injected.
   assert.equal([...names].filter((n) => n === "Read").length, 1);
   assert.equal(tools.find((t) => t.name === "Read")!.description, "real");
-  // A representative sample of CC decoy names is present and unavailable.
-  for (const decoy of ["Agent", "Bash", "Grep", "Task", "Write", "Workflow"]) {
+  // A representative sample of the other CC names is present, as stubs.
+  for (const decoy of [
+    "Agent",
+    "Bash",
+    "Grep",
+    "TaskCreate",
+    "Write",
+    "Workflow",
+  ]) {
     assert.ok(names.has(decoy), `missing decoy ${decoy}`);
   }
   assert.equal(
     tools.find((t) => t.name === "Bash")!.description,
     "This tool is currently unavailable.",
   );
+});
+
+test("applyAnthropicBilling injects the full CC name set as unavailable stubs when no tools are supplied", () => {
+  const { body } = applyAnthropicBilling({
+    system: "You are Claude Code.",
+    messages: [{ role: "user", content: "Hi" }],
+  });
+  const tools = body.tools as Array<{ name: string; description: string }>;
+  const byName = new Map(tools.map((t) => [t.name, t]));
+  // Every Claude Code native tool NAME must exist (as a generic stub). We do
+  // NOT pin the total — a client may always supply more tools (see next test).
+  for (const name of CC_TOOL_NAMES) {
+    assert.ok(byName.has(name), `missing CC tool name ${name}`);
+    assert.equal(
+      byName.get(name)!.description,
+      "This tool is currently unavailable.",
+    );
+  }
+  // No standalone "Task" tool in the CC set (only Task*/TaskCreate/etc.).
+  assert.ok(!byName.has("Task"));
+});
+
+test("applyAnthropicBilling keeps extra client tools on top of the CC names", () => {
+  // A client may supply MORE tools than the CC set — they are all kept; the CC
+  // names just have to also exist.
+  const { body } = applyAnthropicBilling({
+    system: "You are Claude Code.",
+    messages: [{ role: "user", content: "Hi" }],
+    tools: [
+      { name: "frob", description: "custom", input_schema: { type: "object" } },
+      {
+        name: "widgetizer",
+        description: "custom",
+        input_schema: { type: "object" },
+      },
+    ],
+  });
+  const tools = body.tools as Array<{ name: string; description: string }>;
+  const byName = new Map(tools.map((t) => [t.name, t]));
+  // Client's extra tools (PascalCased) are kept verbatim.
+  assert.equal(byName.get("Frob")!.description, "custom");
+  assert.equal(byName.get("Widgetizer")!.description, "custom");
+  // The CC names still all exist as stubs.
+  for (const name of CC_TOOL_NAMES) {
+    assert.ok(byName.has(name), `missing CC tool name ${name}`);
+  }
+  // Total = client tools + all CC names (client tools don't collide with CC).
+  assert.ok(tools.length > CC_TOOL_NAMES.length);
 });
 
 test("applyAnthropicBilling does not duplicate an already-supplied tool", () => {
@@ -758,22 +894,6 @@ test("applyAnthropicBilling does not duplicate an already-supplied tool", () => 
   });
   const tools = body.tools as Array<{ name: string }>;
   assert.equal(tools.filter((t) => t.name === "Read").length, 1);
-});
-
-test("applyAnthropicBilling injects the full decoy set when no tools are supplied", () => {
-  const { body } = applyAnthropicBilling({
-    system: "You are Claude Code.",
-    messages: [{ role: "user", content: "Hi" }],
-  });
-  const tools = body.tools as Array<{ name: string; description: string }>;
-  assert.ok(tools.length >= 30);
-  // All decoys are marked unavailable EXCEPT the callable WebSearch/WebFetch.
-  const unavailable = tools.filter(
-    (t) => t.description === "This tool is currently unavailable.",
-  );
-  assert.equal(unavailable.length, tools.length - 2);
-  assert.ok(tools.some((t) => t.name === "WebSearch"));
-  assert.ok(tools.some((t) => t.name === "WebFetch"));
 });
 
 test("PROXY_CC_DECOY_TOOLS=false disables decoy injection", () => {
@@ -813,29 +933,36 @@ test("a web_search server tool does NOT suppress the WebSearch decoy", () => {
   assert.deepEqual(body.tool_choice, { type: "tool", name: "WebSearch" });
 });
 
-test("the injected WebSearch is callable and carries a required `query`", () => {
-  // A forced `tool_choice:WebSearch` resolves to this injected definition; it
-  // must declare `query` (and WebFetch `url`+`prompt`) or the model emits an
-  // empty tool_use and the client-side search returns 0 results.
+test("a client-supplied PascalCase tool overrides its CC stub (client definition wins)", () => {
+  // The CC names just need to EXIST; a tool the client actually supplies (and
+  // that PascalCases to a CC name) must keep the client's real definition, not
+  // be replaced by the unavailable stub.
   const { body } = applyAnthropicBilling({
     system: "You are Claude Code.",
     messages: [{ role: "user", content: "Hi" }],
     tools: [
       {
-        type: "web_search_20250305",
         name: "web_search",
-      } as unknown as Record<string, unknown>,
+        description: "client-side web search",
+        input_schema: { type: "object", properties: { q: { type: "string" } } },
+      },
     ],
   });
   const tools = body.tools as Array<{
     name: string;
-    input_schema: { properties: Record<string, unknown>; required?: string[] };
+    description: string;
+    input_schema: { properties: Record<string, unknown> };
   }>;
-  const ws = tools.find((t) => t.name === "WebSearch")!;
-  assert.deepEqual(ws.input_schema.required, ["query"]);
-  assert.ok("query" in ws.input_schema.properties);
-  const wf = tools.find((t) => t.name === "WebFetch")!;
-  assert.deepEqual(wf.input_schema.required, ["url", "prompt"]);
+  // `web_search` → PascalCase `WebSearch` → overrides the CC `WebSearch` slot.
+  const ws = tools.filter((t) => t.name === "WebSearch");
+  assert.equal(ws.length, 1, "WebSearch must appear exactly once");
+  assert.equal(ws[0]!.description, "client-side web search");
+  assert.ok("q" in ws[0]!.input_schema.properties);
+  // All other CC names are still filled with the unavailable stub.
+  assert.equal(
+    tools.find((t) => t.name === "Bash")!.description,
+    "This tool is currently unavailable.",
+  );
 });
 
 test("applyAnthropicBilling preserves system[] order [billing, identity, scrubbed...]", () => {

@@ -1858,12 +1858,12 @@ test("e2e: /v1/messages forwards the CC decoy tools upstream when none are suppl
     assert.ok(byName.has("Bash"), "Bash decoy missing");
     assert.ok(byName.has("Read"), "Read decoy missing");
     assert.ok(byName.has("Agent"), "Agent decoy missing");
-    // Most decoys are marked unavailable; WebSearch/WebFetch are callable.
+    // CC names are filled with generic "unavailable" stubs.
     assert.equal(
       byName.get("Bash")!.description,
       "This tool is currently unavailable.",
     );
-    assert.notEqual(
+    assert.equal(
       byName.get("WebSearch")!.description,
       "This tool is currently unavailable.",
     );

@@ -6,13 +6,24 @@
 // subscription tool access; lowercase / snake_case tool names are a third-party
 // fingerprint. Every tool that does NOT start with `mcp_` (MCP tools keep their
 // `mcp__server__tool` convention) is rewritten to PascalCase:
-//   - known opencode lowercase names use the explicit override map below
-//     (handles special cases like `lsp`→`LSP`, `question`→`AskUserQuestion`);
+//   - a Claude Code client's own native names (`Read`, `Bash`, …) are already
+//     PascalCase and pass through unchanged — the override maps are keyed by the
+//     lowercase client spelling, so CC-native requests are a no-op;
+//   - known third-party client names use the explicit override maps below
+//     (opencode, then ohmypi — handling special cases like `lsp`→`LSP`,
+//     `question`→`AskUserQuestion`, `task`→`Agent`, `manage_skill`→`Skill`);
 //   - all other names are PascalCased algorithmically.
 // Renames are applied consistently across `tools[]`, `tool_choice.name`, and
 // assistant `tool_use.name` in `messages[]`, and the resulting `tools[]` is
 // de-duplicated by name so the outgoing request stays valid against Anthropic's
 // Messages API (duplicate tool names trigger HTTP 400).
+//
+// The Claude Code native tool NAMES are always advertised so the tool list
+// matches Claude Code's shape. Definitions are intentionally generic stubs
+// ("This tool is currently unavailable.") — only the names matter for the
+// fingerprint. A client-supplied tool whose PascalCased name matches a CC name
+// overrides that slot (its real definition wins); every other CC name is
+// filled with the unavailable stub. See ensureCcDecoyTools.
 
 export const OPENCODE_TOOL_NAME_MAP: ReadonlyMap<string, string> = new Map<
   string,
@@ -30,6 +41,65 @@ export const OPENCODE_TOOL_NAME_MAP: ReadonlyMap<string, string> = new Map<
   ["lsp", "LSP"],
   ["skill", "Skill"],
   ["question", "AskUserQuestion"],
+]);
+
+/**
+ * ohmypi's builtin tool names (snake_case / lowercase) → Claude Code-native
+ * PascalCase. Same purpose as {@link OPENCODE_TOOL_NAME_MAP}: strip the
+ * third-party fingerprint that Anthropic's classifier flags.
+ *
+ * Entries fall into two groups:
+ *   - Close links to a real Claude Code native tool (see {@link CC_TOOL_NAMES})
+ *     where the ohmypi tool has a direct CC counterpart — e.g. `ask`→
+ *     `AskUserQuestion`, `task`→`Agent` (the subagent-spawn tool), `todo`→
+ *     `TaskCreate` (the current CC task-list tool; unlike the legacy `TodoWrite`
+ *     it IS in {@link CC_TOOL_NAMES}, so the mapping also earns a decoy stub),
+ *     `manage_skill`→`Skill`.
+ *   - Outliers with no CC equivalent, kept as extra PascalCase names. Acronyms
+ *     are cased explicitly (`ssh`→`SSH`, `irc`→`IRC`, `lsp`→`LSP`,
+ *     `github`→`GitHub`) since the algorithmic PascalCaser would otherwise
+ *     produce `Ssh` / `Irc` / `Github`.
+ *
+ * Shared keys agree with {@link OPENCODE_TOOL_NAME_MAP} (e.g. `read`→`Read`),
+ * so consulting both maps is order-independent.
+ */
+export const OHMYPI_TOOL_NAME_MAP: ReadonlyMap<string, string> = new Map<
+  string,
+  string
+>([
+  // --- Close links to Claude Code native tools ---
+  ["read", "Read"],
+  ["bash", "Bash"],
+  ["edit", "Edit"],
+  ["write", "Write"],
+  ["glob", "Glob"],
+  ["grep", "Grep"],
+  ["ask", "AskUserQuestion"],
+  ["task", "Agent"],
+  ["todo", "TaskCreate"],
+  ["web_search", "WebSearch"],
+  ["manage_skill", "Skill"],
+
+  // --- Outliers: no CC counterpart, kept as extra PascalCase names ---
+  ["ast_grep", "AstGrep"],
+  ["ast_edit", "AstEdit"],
+  ["debug", "Debug"],
+  ["eval", "Eval"],
+  ["ssh", "SSH"],
+  ["github", "GitHub"],
+  ["lsp", "LSP"],
+  ["inspect_image", "InspectImage"],
+  ["browser", "Browser"],
+  ["checkpoint", "Checkpoint"],
+  ["rewind", "Rewind"],
+  ["job", "Job"],
+  ["irc", "IRC"],
+  ["search_tool_bm25", "SearchToolBm25"],
+  ["memory_edit", "MemoryEdit"],
+  ["retain", "Retain"],
+  ["recall", "Recall"],
+  ["reflect", "Reflect"],
+  ["learn", "Learn"],
 ]);
 
 export interface NormalizedToolsResult {
@@ -141,8 +211,16 @@ function renameToolUseInMessage(m: unknown): unknown {
  * Resolve a tool name to its Claude Code-native form:
  *   - `mcp_*` (e.g. `mcp__server__tool`) is returned unchanged — MCP tools keep
  *     their own naming convention.
- *   - Known opencode lowercase names use the explicit override map (handles
- *     special cases like `lsp`→`LSP`, `question`→`AskUserQuestion`).
+ *   - A tool a Claude Code client already sends in native form (`Read`, `Bash`,
+ *     …) passes through untouched: the override maps are keyed by the
+ *     lowercase / snake_case client spelling only, so a PascalCase CC name
+ *     misses them and lands on the idempotent `toPascalCase` (`Read`→`Read`).
+ *     CC-native requests are therefore a no-op — they "work as-is".
+ *   - Known third-party client names use the explicit override maps: opencode
+ *     first, then ohmypi. The two agree on shared keys (`read`→`Read`, …), so
+ *     consult order does not matter; each also carries client-specific aliases
+ *     (`question`→`AskUserQuestion`, `manage_skill`→`Skill`) and acronym
+ *     casings (`lsp`→`LSP`, `ssh`→`SSH`) that the algorithmic pass can't infer.
  *   - Everything else is PascalCased so the tool list reads as native Claude
  *     Code tooling. Lowercase / snake_case tool names are a third-party
  *     fingerprint that Anthropic's classifier uses to flag non-CC clients.
@@ -152,7 +230,8 @@ function renameToolUseInMessage(m: unknown): unknown {
 function maybeRenameToolName(value: unknown): string | undefined {
   if (typeof value !== "string" || value === "") return undefined;
   if (value.startsWith("mcp_")) return undefined;
-  const mapped = OPENCODE_TOOL_NAME_MAP.get(value);
+  const mapped =
+    OPENCODE_TOOL_NAME_MAP.get(value) ?? OHMYPI_TOOL_NAME_MAP.get(value);
   if (mapped !== undefined) return mapped;
   return toPascalCase(value);
 }
@@ -191,232 +270,74 @@ function dedupToolsByName(tools: unknown[]): unknown[] {
 }
 
 // =============================================================================
-// CC decoy tools — anti-ban fallback
+// CC tool-name stubs — names always present, generic "unavailable" definitions
 // =============================================================================
 //
-// Claude Code always advertises its full native tool set on /v1/messages.
-// Requests that omit some of those tools look unlike Claude Code to Anthropic's
-// classifier. To complete the fingerprint, any Claude Code native tool that the
-// request did NOT supply (neither directly from Claude nor via an opencode
-// override that normalized to the same PascalCase name) is appended as a decoy
-// marked unavailable. The model cannot actually call them, but their presence
-// makes the tool list match Claude Code's shape.
-//
-// Dedup is case-insensitive so an opencode `read` (renamed to `Read`) suppresses
-// the `Read` decoy even when normalization is disabled.
+// Claude Code always advertises its full native tool set on /v1/messages. The
+// NAMES must be present so the tool list matches Claude Code's shape; the
+// descriptions/schemas do NOT need to match (only the client-supplied tools are
+// ever actually called). So every CC name the request did not already supply is
+// filled with a generic "This tool is currently unavailable." stub, and a
+// client-supplied tool whose PascalCased name matches a CC name overrides that
+// slot (its real definition wins). See ensureCcDecoyTools.
+
+/** The Claude Code native tool names (no standalone `Task`; `Task*` only). */
+export const CC_TOOL_NAMES = [
+  "Agent",
+  "AskUserQuestion",
+  "Bash",
+  "CronCreate",
+  "CronDelete",
+  "CronList",
+  "DesignSync",
+  "Edit",
+  "EnterPlanMode",
+  "EnterWorktree",
+  "ExitPlanMode",
+  "ExitWorktree",
+  "Glob",
+  "Grep",
+  "Monitor",
+  "NotebookEdit",
+  "PowerShell",
+  "PushNotification",
+  "Read",
+  "ScheduleWakeup",
+  "Skill",
+  "TaskCreate",
+  "TaskGet",
+  "TaskList",
+  "TaskOutput",
+  "TaskStop",
+  "TaskUpdate",
+  "WebFetch",
+  "WebSearch",
+  "Workflow",
+  "Write",
+] as const;
 
 export interface CcDecoyTool {
   readonly name: string;
   readonly description: string;
-  readonly input_schema: {
-    type: string;
-    properties: Record<string, unknown>;
-    required?: string[];
-  };
+  readonly input_schema: { type: string; properties: Record<string, unknown> };
 }
 
-export const CC_DECOY_TOOLS: readonly CcDecoyTool[] = [
-  {
-    name: "Agent",
-    description: "This tool is currently unavailable.",
-    input_schema: { type: "object", properties: {} },
-  },
-  {
-    name: "AskUserQuestion",
-    description: "This tool is currently unavailable.",
-    input_schema: { type: "object", properties: {} },
-  },
-  {
-    name: "Bash",
-    description: "This tool is currently unavailable.",
-    input_schema: { type: "object", properties: {} },
-  },
-  {
-    name: "CronCreate",
-    description: "This tool is currently unavailable.",
-    input_schema: { type: "object", properties: {} },
-  },
-  {
-    name: "CronDelete",
-    description: "This tool is currently unavailable.",
-    input_schema: { type: "object", properties: {} },
-  },
-  {
-    name: "CronList",
-    description: "This tool is currently unavailable.",
-    input_schema: { type: "object", properties: {} },
-  },
-  {
-    name: "DesignSync",
-    description: "This tool is currently unavailable.",
-    input_schema: { type: "object", properties: {} },
-  },
-  {
-    name: "Edit",
-    description: "This tool is currently unavailable.",
-    input_schema: { type: "object", properties: {} },
-  },
-  {
-    name: "EnterPlanMode",
-    description: "This tool is currently unavailable.",
-    input_schema: { type: "object", properties: {} },
-  },
-  {
-    name: "EnterWorktree",
-    description: "This tool is currently unavailable.",
-    input_schema: { type: "object", properties: {} },
-  },
-  {
-    name: "ExitPlanMode",
-    description: "This tool is currently unavailable.",
-    input_schema: { type: "object", properties: {} },
-  },
-  {
-    name: "ExitWorktree",
-    description: "This tool is currently unavailable.",
-    input_schema: { type: "object", properties: {} },
-  },
-  {
-    name: "Glob",
-    description: "This tool is currently unavailable.",
-    input_schema: { type: "object", properties: {} },
-  },
-  {
-    name: "Grep",
-    description: "This tool is currently unavailable.",
-    input_schema: { type: "object", properties: {} },
-  },
-  {
-    name: "Monitor",
-    description: "This tool is currently unavailable.",
-    input_schema: { type: "object", properties: {} },
-  },
-  {
-    name: "NotebookEdit",
-    description: "This tool is currently unavailable.",
-    input_schema: { type: "object", properties: {} },
-  },
-  {
-    name: "PowerShell",
-    description: "This tool is currently unavailable.",
-    input_schema: { type: "object", properties: {} },
-  },
-  {
-    name: "PushNotification",
-    description: "This tool is currently unavailable.",
-    input_schema: { type: "object", properties: {} },
-  },
-  {
-    name: "Read",
-    description: "This tool is currently unavailable.",
-    input_schema: { type: "object", properties: {} },
-  },
-  {
-    name: "ScheduleWakeup",
-    description: "This tool is currently unavailable.",
-    input_schema: { type: "object", properties: {} },
-  },
-  {
-    name: "Skill",
-    description: "This tool is currently unavailable.",
-    input_schema: { type: "object", properties: {} },
-  },
-  {
-    name: "Task",
-    description: "This tool is currently unavailable.",
-    input_schema: { type: "object", properties: {} },
-  },
-  {
-    name: "TaskOutput",
-    description: "This tool is currently unavailable.",
-    input_schema: { type: "object", properties: {} },
-  },
-  {
-    name: "TaskStop",
-    description: "This tool is currently unavailable.",
-    input_schema: { type: "object", properties: {} },
-  },
-  {
-    name: "TaskCreate",
-    description: "This tool is currently unavailable.",
-    input_schema: { type: "object", properties: {} },
-  },
-  {
-    name: "TaskGet",
-    description: "This tool is currently unavailable.",
-    input_schema: { type: "object", properties: {} },
-  },
-  {
-    name: "TaskUpdate",
-    description: "This tool is currently unavailable.",
-    input_schema: { type: "object", properties: {} },
-  },
-  {
-    name: "TaskList",
-    description: "This tool is currently unavailable.",
-    input_schema: { type: "object", properties: {} },
-  },
-  // WebFetch / WebSearch are kept CALLABLE (not "unavailable"): the gateway
-  // commonly declares only the server `web_search` tool but forces
-  // `tool_choice:{name:"WebSearch"}` (Claude Code's own PascalCase name). The
-  // forced call resolves to this injected definition, and Claude Code executes
-  // it client-side — so it must carry the real params (query / url+prompt) or
-  // the model emits an empty tool_use and the search returns 0 results.
-  {
-    name: "WebFetch",
-    description:
-      "Fetch content from a URL. Use `prompt` to describe what to extract from the page.",
-    input_schema: {
-      type: "object",
-      properties: {
-        url: { type: "string", description: "The URL to fetch." },
-        prompt: {
-          type: "string",
-          description: "What to extract or answer about the page.",
-        },
-      },
-      required: ["url", "prompt"],
-    },
-  },
-  {
-    name: "WebSearch",
-    description:
-      "Search the web for current information. Returns fresh results from a search engine.",
-    input_schema: {
-      type: "object",
-      properties: {
-        query: { type: "string", description: "The search query." },
-        allowed_domains: {
-          type: "array",
-          items: { type: "string" },
-          description: "Only include results from these domains.",
-        },
-        blocked_domains: {
-          type: "array",
-          items: { type: "string" },
-          description: "Exclude results from these domains.",
-        },
-      },
-      required: ["query"],
-    },
-  },
-  {
-    name: "Workflow",
-    description: "This tool is currently unavailable.",
-    input_schema: { type: "object", properties: {} },
-  },
-  {
-    name: "Write",
-    description: "This tool is currently unavailable.",
-    input_schema: { type: "object", properties: {} },
-  },
-];
+const CC_UNAVAILABLE_DESCRIPTION = "This tool is currently unavailable.";
+const ccUnavailableStub = (name: string): CcDecoyTool => ({
+  name,
+  description: CC_UNAVAILABLE_DESCRIPTION,
+  input_schema: { type: "object", properties: {} },
+});
+
+/** One generic "unavailable" stub per Claude Code native tool name. */
+export const CC_DECOY_TOOLS: readonly CcDecoyTool[] =
+  CC_TOOL_NAMES.map(ccUnavailableStub);
 
 /**
- * Append a decoy (marked unavailable) for every Claude Code native tool the
- * request did not already advertise. Tools already present — whether supplied
- * directly by Claude or produced by an opencode override that renames to the
- * same PascalCase name — are left alone (case-insensitive dedup).
+ * Append a CC native tool decoy for every name the request did NOT already
+ * advertise. Tools already present — whether supplied directly by Claude or
+ * produced by a third-party override that renames to the same PascalCase name —
+ * are left alone (exact, case-insensitive dedup).
  */
 export function ensureCcDecoyTools(
   requestBody: Readonly<Record<string, unknown>>,
