@@ -13,11 +13,7 @@ import type {
 import { resolveConfig, resolvePort } from "./config.js";
 import { applyPrefillFix, modelNeedsFix } from "./prefill-fix.js";
 import { extractThinkingProps, formatThinkingLog } from "./thinking-restore.js";
-import {
-  computeBillingHeader,
-  extractFirstUserMessageText,
-  injectBillingHeader,
-} from "./billing.js";
+import { applyAnthropicBilling, withBetaQuery } from "./billing.js";
 
 const HOP_BY_HOP = new Set([
   "connection",
@@ -347,6 +343,128 @@ export function isStreamError(body: string): string | null {
   return null;
 }
 
+// Remap tool_use names in a buffered JSON response body (non-SSE) back to the
+// client's original tool names. Returns the buffer unchanged when the body is
+// not JSON, has no tool_use blocks, or no names need remapping.
+function remapJsonResponseToolNames(
+  buf: Buffer,
+  map: Map<string, string>,
+): Buffer {
+  if (map.size === 0 || buf.length === 0) return buf;
+  let obj: Record<string, unknown>;
+  try {
+    obj = JSON.parse(buf.toString("utf8"));
+  } catch {
+    return buf;
+  }
+  if (!obj || typeof obj !== "object") return buf;
+  const content = obj["content"];
+  if (!Array.isArray(content)) return buf;
+  let changed = false;
+  for (const block of content) {
+    if (
+      block &&
+      typeof block === "object" &&
+      (block as Record<string, unknown>)["type"] === "tool_use"
+    ) {
+      const b = block as Record<string, unknown>;
+      const name = b["name"];
+      if (typeof name === "string") {
+        const orig = map.get(name);
+        if (orig !== undefined && orig !== name) {
+          b["name"] = orig;
+          changed = true;
+        }
+      }
+    }
+  }
+  return changed ? Buffer.from(JSON.stringify(obj)) : buf;
+}
+
+/**
+ * Streaming SSE rewriter that maps `content_block_start` tool_use names back to
+ * the client's originals. SSE chunks do not align with event boundaries, so it
+ * buffers partial lines and only emits complete (possibly rewritten) lines;
+ * the final partial line is flushed on stream end. Non-`data:` lines, data
+ * lines that are not tool-use content_block_start events, and `[DONE]` markers
+ * pass through untouched.
+ */
+class SseToolNameRewriter {
+  private pending = "";
+  constructor(private readonly map: Map<string, string>) {}
+
+  push(chunk: Buffer): Buffer {
+    this.pending += chunk.toString("utf8");
+    let out = "";
+    let nl: number;
+    while ((nl = this.pending.indexOf("\n")) >= 0) {
+      const line = this.pending.slice(0, nl + 1);
+      this.pending = this.pending.slice(nl + 1);
+      out += this.rewriteLine(line);
+    }
+    return Buffer.from(out, "utf8");
+  }
+
+  flush(): Buffer {
+    if (this.pending.length === 0) return Buffer.alloc(0);
+    const out = this.rewriteLine(this.pending);
+    this.pending = "";
+    return Buffer.from(out, "utf8");
+  }
+
+  private rewriteLine(lineWithNl: string): string {
+    const nlMatch = lineWithNl.match(/(\r?\n)$/);
+    const nl = nlMatch ? nlMatch[1] : "";
+    const line = nl
+      ? lineWithNl.slice(0, lineWithNl.length - nl.length)
+      : lineWithNl;
+    const m = line.match(/^data:\s*(.*)$/);
+    if (!m) return lineWithNl;
+    const raw = m[1];
+    if (!raw || raw === "[DONE]" || raw.charCodeAt(0) !== 123 /* '{' */)
+      return lineWithNl;
+    let obj: Record<string, unknown>;
+    try {
+      obj = JSON.parse(raw);
+    } catch {
+      return lineWithNl;
+    }
+    const cb = obj["content_block"] as Record<string, unknown> | undefined;
+    if (
+      obj["type"] === "content_block_start" &&
+      cb &&
+      cb["type"] === "tool_use" &&
+      typeof cb["name"] === "string"
+    ) {
+      const orig = this.map.get(cb["name"]);
+      if (orig !== undefined && orig !== cb["name"]) {
+        cb["name"] = orig;
+        return `data: ${JSON.stringify(obj)}${nl}`;
+      }
+    }
+    return lineWithNl;
+  }
+}
+
+/**
+ * Copy upstream response headers for forwarding to the client, dropping the
+ * hop-by-hop/framing headers we manage ourselves (content-length is dropped
+ * because the body may be rewritten before it is sent, which would desync the
+ * declared length).
+ */
+function forwardHeaders(
+  upstreamHeaders: http.IncomingHttpHeaders,
+): Record<string, string | string[]> {
+  const out: Record<string, string | string[]> = {};
+  for (const [k, v] of Object.entries(upstreamHeaders)) {
+    if (v === undefined) continue;
+    const lk = k.toLowerCase();
+    if (lk === "content-length" || lk === "transfer-encoding") continue;
+    out[k] = v;
+  }
+  return out;
+}
+
 export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
   const config = resolveConfig(opts);
   const upstreamKeys: string[] = Array.isArray(config.upstreamApiKey)
@@ -589,6 +707,23 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
     return out;
   }
 
+  /**
+   * Write a chunk to the client response, applying proper backpressure: if the
+   * client socket's buffer is full, pause the upstream until it drains so we
+   * never buffer an unbounded stream in memory.
+   */
+  function writeWithBackpressure(
+    res: ServerResponse,
+    upRes: IncomingMessage,
+    chunk: Buffer,
+  ): void {
+    if (chunk.length === 0) return;
+    if (!res.write(chunk)) {
+      upRes.pause();
+      res.once("drain", () => upRes.resume());
+    }
+  }
+
   function attemptOnce(
     req: IncomingMessage,
     res: ServerResponse,
@@ -596,6 +731,8 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
     body: Buffer | null,
     keyIndex: number,
     sessionId: string | null,
+    billingHeader: string | null,
+    toolRenameMap: Map<string, string> | null,
   ): Promise<AttemptResult> {
     const upstream = new URL(upstreamPath, config.upstreamBaseUrl);
     const { auth, rawKey, keyId } = resolveAuth(req, keyIndex);
@@ -618,6 +755,9 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
       body ? body.length : 0,
       sessionId,
     );
+    if (billingHeader) {
+      outHeaders["x-anthropic-billing-header"] = billingHeader;
+    }
     const transport = upstream.protocol === "https:" ? https : http;
     const reqMethod = req.method ?? "?";
 
@@ -785,16 +925,7 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
               `status ${status}`,
             ).then((resBody) => {
               if (!res.headersSent && !res.writableEnded) {
-                const fwdHeaders: Record<string, string | string[]> = {};
-                for (const [k, v] of Object.entries(upRes.headers)) {
-                  if (v === undefined) continue;
-                  const lk = k.toLowerCase();
-                  if (lk === "content-length" || lk === "transfer-encoding") {
-                    continue;
-                  }
-                  fwdHeaders[k] = v;
-                }
-                res.writeHead(status, fwdHeaders);
+                res.writeHead(status, forwardHeaders(upRes.headers));
                 res.end(resBody ?? "");
               }
               finish({ ok: true, committed: true });
@@ -814,21 +945,18 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
             return;
           }
 
-          const fwdHeaders: Record<string, string | string[]> = {};
-          for (const [k, v] of Object.entries(upRes.headers)) {
-            if (v === undefined) continue;
-            const lk = k.toLowerCase();
-            if (lk === "content-length" || lk === "transfer-encoding") {
-              continue;
-            }
-            fwdHeaders[k] = v;
-          }
+          const fwdHeaders = forwardHeaders(upRes.headers);
 
           const contentType = String(
             upRes.headers["content-type"] || "",
           ).toLowerCase();
 
           const isSSE = contentType.includes("text/event-stream");
+          // SSE tool-name rewriter: only when request tools were renamed.
+          const sseRewriter =
+            isSSE && toolRenameMap && toolRenameMap.size > 0
+              ? new SseToolNameRewriter(toolRenameMap)
+              : null;
 
           const chunks: Buffer[] = [];
           let streaming = false;
@@ -840,24 +968,22 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
               `[vsllm-proxy] stream-start key=${keyId} ${reqMethod} ${upstreamPath}`,
             );
             res.writeHead(status, fwdHeaders);
-            const buffered = Buffer.concat(chunks);
+            const buffered = sseRewriter
+              ? sseRewriter.push(Buffer.concat(chunks))
+              : Buffer.concat(chunks);
             // Release the buffered chunks so they can be GC'd while the
             // (potentially long-lived) stream continues.
             chunks.length = 0;
-            if (buffered.length) {
-              if (!res.write(buffered)) {
-                upRes.pause();
-                res.once("drain", () => upRes.resume());
-              }
-            }
+            writeWithBackpressure(res, upRes, buffered);
           };
 
           upRes.on("data", (c: Buffer) => {
             if (streaming) {
-              if (!res.write(c)) {
-                upRes.pause();
-                res.once("drain", () => upRes.resume());
-              }
+              writeWithBackpressure(
+                res,
+                upRes,
+                sseRewriter ? sseRewriter.push(c) : c,
+              );
               return;
             }
 
@@ -899,6 +1025,10 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
 
           upRes.on("end", () => {
             if (streaming) {
+              if (sseRewriter) {
+                // Best-effort flush of the final partial line before closing.
+                writeWithBackpressure(res, upRes, sseRewriter.flush());
+              }
               res.end();
               const elapsed = ((Date.now() - streamStartTime) / 1000).toFixed(
                 1,
@@ -925,8 +1055,12 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
               return;
             }
 
+            const finalResBody =
+              toolRenameMap && toolRenameMap.size > 0
+                ? remapJsonResponseToolNames(resBody, toolRenameMap)
+                : resBody;
             res.writeHead(status, fwdHeaders);
-            res.end(resBody);
+            res.end(finalResBody);
             finish({ ok: true, committed: true, served: true });
           });
         },
@@ -975,6 +1109,8 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
     upstreamPath: string,
     body: Buffer | null,
     sessionId: string | null,
+    billingHeader: string | null,
+    toolRenameMap: Map<string, string> | null,
   ): Promise<void> {
     const tried = new Set<number>();
     let lastReason = "no attempts";
@@ -997,6 +1133,8 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
         body,
         keyIndex,
         sessionId,
+        billingHeader,
+        toolRenameMap,
       );
       if (result.ok) {
         // Remember that this key successfully served this model so future
@@ -1069,24 +1207,35 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
     }
   }
 
-  function maybeInjectBilling(buf: Buffer): Buffer {
-    if (!buf || buf.length === 0) return buf;
+  function maybeInjectBilling(buf: Buffer): {
+    buf: Buffer;
+    header: string | null;
+    toolRenameMap: Map<string, string> | null;
+  } {
+    if (!buf || buf.length === 0)
+      return { buf, header: null, toolRenameMap: null };
     let parsed: Record<string, unknown>;
     try {
       parsed = JSON.parse(buf.toString("utf8")) as Record<string, unknown>;
     } catch {
-      return buf;
+      return { buf, header: null, toolRenameMap: null };
     }
-    if (!parsed || typeof parsed !== "object") return buf;
-    // The billing header is derived from the first user message's text, so it
-    // must be recomputed for every request.
-    const messageText = extractFirstUserMessageText(parsed);
-    const billingText = computeBillingHeader(messageText);
-    console.log(`[vsllm-proxy] billing ${billingText}`);
-    if (injectBillingHeader(parsed, billingText)) {
-      return Buffer.from(JSON.stringify(parsed));
-    }
-    return buf;
+    if (!parsed || typeof parsed !== "object")
+      return { buf, header: null, toolRenameMap: null };
+    // The billing header + body attestation are derived from the request body,
+    // so they must be recomputed for every request. The tool rename map is
+    // returned so tool_use names in the response can be mapped back.
+    const {
+      body: transformed,
+      header,
+      toolRenameMap,
+    } = applyAnthropicBilling(parsed);
+    console.log(`[vsllm-proxy] billing ${header}`);
+    return {
+      buf: Buffer.from(JSON.stringify(transformed)),
+      header,
+      toolRenameMap,
+    };
   }
 
   const handler = async (
@@ -1122,17 +1271,29 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
       const raw = await readBody(req);
       let body: Buffer;
       let sessionId: string | null = null;
+      let billingHeader: string | null = null;
+      let toolRenameMap: Map<string, string> | null = null;
 
       if (routed.callType === "messages") {
         const prefilled = maybeApplyFix(raw, routed.callType);
         const result = applyMessagesFix(prefilled);
-        body = maybeInjectBilling(result.buf);
+        const injected = maybeInjectBilling(result.buf);
+        body = injected.buf;
+        billingHeader = injected.header;
+        toolRenameMap = injected.toolRenameMap;
         sessionId = result.sessionId;
       } else if (routed.callType) {
         body = maybeApplyFix(raw, routed.callType);
       } else {
         body = raw;
       }
+
+      // OAuth-subscription requests need ?beta=true on /v1/messages; append it
+      // to the upstream path so the request line carries it through.
+      const upstreamPath =
+        routed.callType === "messages"
+          ? withBetaQuery(routed.upstreamPath)
+          : routed.upstreamPath;
 
       if (config.enableRequestLogging) {
         let parsedBody: Record<string, unknown> | null = null;
@@ -1159,7 +1320,15 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
         }
       }
 
-      await forward(req, res, routed.upstreamPath, body, sessionId);
+      await forward(
+        req,
+        res,
+        upstreamPath,
+        body,
+        sessionId,
+        billingHeader,
+        toolRenameMap,
+      );
     } catch (err: unknown) {
       if (!res.headersSent && !res.writableEnded) {
         respond(res, 500, {

@@ -1,111 +1,109 @@
-import test from "node:test";
+import { test, beforeEach, afterEach } from "node:test";
 import assert from "node:assert";
+import { createHash } from "node:crypto";
 import {
-  computeBillingHeader,
-  extractFirstUserMessageText,
-  injectBillingHeader,
-  isBillingText,
+  applyAnthropicBilling,
+  buildBillingBlock,
+  buildFinalBody,
+  buildSystemArray,
+  CC_ENTRYPOINT,
   CC_VERSION,
+  CCH_PLACEHOLDER,
+  CLAUDE_CODE_IDENTITY_TEXT,
+  computeCchForBody,
+  computeVersionSuffix,
+  extractFirstUserText,
+  isBillingText,
+  normalizeSystemBlocks,
+  serializeBody,
+  stripExistingFingerprint,
+  withBetaQuery,
 } from "../src/billing.js";
 
-// ---------------------------------------------------------------------------
-// Test vectors from the spec
-//   Message "hey":
-//     SHA-256("hey") = "fa690b82..."  -> cch = "fa690"
-//     sampled (all out of bounds)     = "000"
-//     SHA-256("59cf53e54c78"+"000"+"2.1.37")[:3] = "0d9"
-//     => cc_version = "2.1.37.0d9"
-//   Message "":
-//     SHA-256("") = "e3b0c442..."     -> cch = "e3b0c"
-// ---------------------------------------------------------------------------
+const ENV_KEYS = [
+  "PROXY_CC_VERSION",
+  "PROXY_CCH_VALUE",
+  "PROXY_CC_SCRUB_MESSAGES",
+  "PROXY_CC_NORMALIZE_TOOLS",
+  "PROXY_CC_DECOY_TOOLS",
+] as const;
 
-test("computeBillingHeader matches spec test vector for 'hey'", () => {
-  const h = computeBillingHeader("hey");
-  assert.ok(h.startsWith("x-anthropic-billing-header: "), `got: ${h}`);
-  assert.ok(h.includes("cc_version=2.1.37.0d9;"), `cc_version mismatch: ${h}`);
-  assert.ok(h.includes("cc_entrypoint=cli;"), `got: ${h}`);
-  assert.ok(h.includes("cch=fa690;"), `cch mismatch: ${h}`);
-  assert.ok(h.endsWith(";"));
+const snapshot: Record<string, string | undefined> = {};
+beforeEach(() => {
+  for (const k of ENV_KEYS) {
+    snapshot[k] = process.env[k];
+    delete process.env[k];
+  }
+});
+afterEach(() => {
+  for (const k of ENV_KEYS) {
+    if (snapshot[k] === undefined) delete process.env[k];
+    else process.env[k] = snapshot[k]!;
+  }
 });
 
-test("computeBillingHeader matches spec test vector for empty message", () => {
-  const h = computeBillingHeader("");
-  assert.ok(h.includes("cch=e3b0c;"), `cch mismatch: ${h}`);
-  // Empty message: sampled = "000" -> same version hash as "hey"
-  assert.ok(h.includes("cc_version=2.1.37.0d9;"), `got: ${h}`);
-});
-
-test("computeBillingHeader produces the expected overall shape", () => {
-  const h = computeBillingHeader("some longer message text here");
-  assert.match(
-    h,
-    /^x-anthropic-billing-header: cc_version=\d+\.\d+\.\d+\.[0-9a-f]{3}; cc_entrypoint=cli; cch=[0-9a-f]{5};$/,
-  );
-});
-
-test("computeBillingHeader changes when the message changes", () => {
-  const a = computeBillingHeader("hello");
-  const b = computeBillingHeader("world");
-  assert.notEqual(a, b, "different messages must produce different headers");
-  // cch must differ
-  assert.notEqual(
-    a.match(/cch=([0-9a-f]{5})/)?.[1],
-    b.match(/cch=([0-9a-f]{5})/)?.[1],
-  );
-});
-
-test("computeBillingHeader supports custom entrypoint", () => {
-  const h = computeBillingHeader("hey", "sdk");
-  assert.ok(h.includes("cc_entrypoint=sdk;"), `got: ${h}`);
-});
-
-test("computeBillingHeader samples characters at indices 4, 7, 20", () => {
-  // Message long enough that all indices are in bounds.
-  // "0123456789abcdefghijklmnop" (length 27)
-  //   index 4 = '4', index 7 = '7', index 20 = 'k'
-  const msg = "0123456789abcdefghijklmnop";
-  const h = computeBillingHeader(msg);
-  // We can't easily verify the hash by hand, but we can verify it's stable
-  // and different from the all-padded version.
-  const padded = computeBillingHeader("hey"); // sampled "000"
-  assert.notEqual(
-    h.match(/cc_version=2\.1\.37\.([0-9a-f]{3})/)?.[1],
-    padded.match(/cc_version=2\.1\.37\.([0-9a-f]{3})/)?.[1],
-    "version hash should differ when sampled chars are in bounds",
-  );
-});
-
-test("CC_VERSION is exported", () => {
-  assert.equal(CC_VERSION, "2.1.37");
-});
-
-test("isBillingText recognises billing header lines", () => {
-  assert.ok(
-    isBillingText(
-      "x-anthropic-billing-header: cc_version=2.1.37.0d9; cc_entrypoint=cli; cch=fa690;",
-    ),
-  );
-  assert.ok(isBillingText("  x-anthropic-billing-header: whatever"));
-  assert.ok(!isBillingText("You are Claude Code."));
-  assert.ok(!isBillingText(undefined));
-});
+function sha256(s: string): string {
+  return createHash("sha256").update(s, "utf8").digest("hex");
+}
 
 // ---------------------------------------------------------------------------
-// extractFirstUserMessageText
+// Constants
 // ---------------------------------------------------------------------------
 
-test("extractFirstUserMessageText returns string content", () => {
+test("CC_VERSION is the current Claude Code release (2.1.196)", () => {
+  assert.equal(CC_VERSION, "2.1.196");
+  assert.equal(CC_ENTRYPOINT, "cli");
+});
+
+test("CLAUDE_CODE_IDENTITY_TEXT is the exact required string", () => {
   assert.equal(
-    extractFirstUserMessageText({
+    CLAUDE_CODE_IDENTITY_TEXT,
+    "You are Claude Code, Anthropic's official CLI for Claude.",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// computeVersionSuffix
+// ---------------------------------------------------------------------------
+
+test("computeVersionSuffix pads missing indices with '0'", () => {
+  // "hey" (length 3): indices 4/7/20 all out of bounds → "000".
+  const expected = sha256(`59cf53e54c78000${CC_VERSION}`).slice(0, 3);
+  assert.equal(computeVersionSuffix("hey", CC_VERSION), expected);
+  assert.equal(computeVersionSuffix("", CC_VERSION), expected);
+});
+
+test("computeVersionSuffix samples chars at indices 4, 7, 20 (plain indexing)", () => {
+  // "hello world": index4='o', index7='o', index20 out-of-bounds='0' → "oo0".
+  const expected = sha256(`59cf53e54c78oo0${CC_VERSION}`).slice(0, 3);
+  assert.equal(computeVersionSuffix("hello world", CC_VERSION), expected);
+});
+
+test("computeVersionSuffix differs once sampled chars are in bounds", () => {
+  const short = computeVersionSuffix("hi", CC_VERSION); // "000"
+  const long = computeVersionSuffix(
+    "0123456789abcdefghijklmnop", // index4='4', index7='7', index20='k'
+    CC_VERSION,
+  );
+  assert.notEqual(short, long);
+});
+
+// ---------------------------------------------------------------------------
+// extractFirstUserText
+// ---------------------------------------------------------------------------
+
+test("extractFirstUserText returns string content of the first user message", () => {
+  assert.equal(
+    extractFirstUserText({
       messages: [{ role: "user", content: "hey" }],
     }),
     "hey",
   );
 });
 
-test("extractFirstUserMessageText concatenates text blocks", () => {
+test("extractFirstUserText returns the FIRST text block only (not concatenated)", () => {
   assert.equal(
-    extractFirstUserMessageText({
+    extractFirstUserText({
       messages: [
         {
           role: "user",
@@ -117,15 +115,29 @@ test("extractFirstUserMessageText concatenates text blocks", () => {
         },
       ],
     }),
-    "hello world",
+    "hello ",
   );
 });
 
-test("extractFirstUserMessageText finds the first user message", () => {
+test("extractFirstUserText accepts input_text blocks (OpenAI-style)", () => {
   assert.equal(
-    extractFirstUserMessageText({
+    extractFirstUserText({
       messages: [
-        { role: "assistant", content: "hi" },
+        {
+          role: "user",
+          content: [{ type: "input_text", text: "openai block" }],
+        },
+      ],
+    }),
+    "openai block",
+  );
+});
+
+test("extractFirstUserText finds the first user message, skipping assistants", () => {
+  assert.equal(
+    extractFirstUserText({
+      messages: [
+        { role: "assistant", content: "x" },
         { role: "user", content: "found me" },
         { role: "user", content: "not me" },
       ],
@@ -134,106 +146,581 @@ test("extractFirstUserMessageText finds the first user message", () => {
   );
 });
 
-test("extractFirstUserMessageText returns empty when no user message", () => {
+test("extractFirstUserText returns empty when there is no user text", () => {
   assert.equal(
-    extractFirstUserMessageText({ messages: [{ role: "assistant", content: "x" }] }),
+    extractFirstUserText({ messages: [{ role: "assistant", content: "x" }] }),
     "",
   );
-  assert.equal(extractFirstUserMessageText({}), "");
-  assert.equal(extractFirstUserMessageText({ messages: [] }), "");
+  assert.equal(extractFirstUserText({}), "");
+  assert.equal(extractFirstUserText({ messages: [] }), "");
 });
 
 // ---------------------------------------------------------------------------
-// injectBillingHeader
+// system[] construction
 // ---------------------------------------------------------------------------
 
-test("injectBillingHeader creates system when missing", () => {
-  const body: Record<string, unknown> = { model: "claude-sonnet-4-6" };
-  const text = computeBillingHeader("hey");
-  const changed = injectBillingHeader(body, text);
-  assert.equal(changed, true);
-  assert.ok(Array.isArray(body.system));
-  const sys = body.system as Array<{ type: string; text: string }>;
-  assert.equal(sys.length, 1);
-  assert.equal(sys[0].type, "text");
-  assert.ok(sys[0].text.startsWith("x-anthropic-billing-header:"));
-  assert.equal(sys[0].text, text);
+test("isBillingText recognises billing header lines", () => {
+  assert.ok(
+    isBillingText(
+      "x-anthropic-billing-header: cc_version=2.1.196.0d9; cc_entrypoint=cli; cch=fa690;",
+    ),
+  );
+  assert.ok(isBillingText("  x-anthropic-billing-header: whatever"));
+  assert.ok(!isBillingText("You are Claude Code."));
+  assert.ok(!isBillingText(undefined));
 });
 
-test("injectBillingHeader converts a string system to an array", () => {
-  const body: Record<string, unknown> = { system: "You are Claude Code." };
-  const text = computeBillingHeader("hey");
-  injectBillingHeader(body, text);
-  const sys = body.system as Array<{ type: string; text: string }>;
-  assert.equal(sys.length, 2);
-  assert.equal(sys[0].text, text);
-  assert.equal(sys[1].text, "You are Claude Code.");
-});
-
-test("injectBillingHeader prepends when no billing block exists", () => {
-  const body: Record<string, unknown> = {
-    system: [
-      {
-        type: "text",
-        text: "You are Claude Code.",
-        cache_control: { type: "ephemeral" },
-      },
+test("normalizeSystemBlocks converts string and array forms", () => {
+  assert.deepEqual(normalizeSystemBlocks("hello"), [
+    { type: "text", text: "hello" },
+  ]);
+  assert.deepEqual(
+    normalizeSystemBlocks([
+      "str",
+      { type: "text", text: "obj", cache_control: { type: "ephemeral" } },
+    ]),
+    [
+      { type: "text", text: "str" },
+      { type: "text", text: "obj", cache_control: { type: "ephemeral" } },
     ],
-  };
-  const text = computeBillingHeader("hey");
-  injectBillingHeader(body, text);
-  const sys = body.system as Array<{ type: string; text: string }>;
-  assert.equal(sys.length, 2);
-  assert.equal(sys[0].text, text);
-  assert.equal(sys[1].text, "You are Claude Code.");
-  // Existing block's cache_control is untouched.
-  assert.deepEqual((sys[1] as { cache_control?: unknown }).cache_control, {
-    type: "ephemeral",
+  );
+  assert.deepEqual(normalizeSystemBlocks(undefined), []);
+});
+
+test("stripExistingFingerprint drops identity and billing blocks", () => {
+  const blocks = normalizeSystemBlocks([
+    { type: "text", text: "x-anthropic-billing-header: old" },
+    { type: "text", text: CLAUDE_CODE_IDENTITY_TEXT },
+    { type: "text", text: "keep me" },
+  ]);
+  const cleaned = stripExistingFingerprint(blocks);
+  assert.deepEqual(
+    cleaned.map((b) => b.text),
+    ["keep me"],
+  );
+});
+
+test("buildSystemArray orders [billing, identity, ...cleaned] and dedups identity", () => {
+  const billing = buildBillingBlock(
+    "cc_version=x; cc_entrypoint=cli; cch=00000;",
+  );
+  const sys = buildSystemArray(
+    [
+      { type: "text", text: CLAUDE_CODE_IDENTITY_TEXT },
+      { type: "text", text: "Original", cache_control: { type: "ephemeral" } },
+    ],
+    billing,
+  );
+  assert.equal(sys.length, 3);
+  assert.equal(sys[0], billing);
+  assert.deepEqual(sys[1], { type: "text", text: CLAUDE_CODE_IDENTITY_TEXT });
+  assert.deepEqual(sys[2], {
+    type: "text",
+    text: "Original",
+    cache_control: { type: "ephemeral" },
   });
 });
 
-test("injectBillingHeader replaces an existing billing block in place", () => {
-  const body: Record<string, unknown> = {
+// ---------------------------------------------------------------------------
+// buildFinalBody — deterministic key order
+// ---------------------------------------------------------------------------
+
+test("buildFinalBody emits keys in Claude Code's order", () => {
+  // Feed keys in scrambled order; output must be canonical.
+  const original: Record<string, unknown> = {
+    stream: true,
+    model: "claude-sonnet-4-6",
+    messages: [{ role: "user", content: "hi" }],
+    max_tokens: 1024,
+    thinking: { type: "enabled", budget_tokens: 1024 },
+  };
+  const out = buildFinalBody(original, []);
+  assert.deepEqual(Object.keys(out), [
+    "system",
+    "messages",
+    "model",
+    "max_tokens",
+    "stream",
+    "thinking",
+  ]);
+});
+
+test("buildFinalBody drops unknown keys", () => {
+  const out = buildFinalBody(
+    { model: "x", bogus: true, _callType: "messages" },
+    [],
+  );
+  assert.deepEqual(Object.keys(out), ["system", "model"]);
+});
+
+// ---------------------------------------------------------------------------
+// withBetaQuery
+// ---------------------------------------------------------------------------
+
+test("withBetaQuery appends ?beta=true with the right separator", () => {
+  assert.equal(
+    withBetaQuery("https://api.anthropic.com/v1/messages"),
+    "https://api.anthropic.com/v1/messages?beta=true",
+  );
+  assert.equal(
+    withBetaQuery("https://api.anthropic.com/v1/messages?beta=true"),
+    "https://api.anthropic.com/v1/messages?beta=true",
+  );
+  assert.equal(
+    withBetaQuery("https://api.anthropic.com/v1/messages?stream=true"),
+    "https://api.anthropic.com/v1/messages?stream=true&beta=true",
+  );
+});
+
+test("withBetaQuery works on a bare path", () => {
+  assert.equal(withBetaQuery("/v1/messages"), "/v1/messages?beta=true");
+});
+
+test("withBetaQuery leaves non-/v1/messages URLs untouched", () => {
+  assert.equal(
+    withBetaQuery("https://api.anthropic.com/v1/models"),
+    "https://api.anthropic.com/v1/models",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// computeCchForBody
+// ---------------------------------------------------------------------------
+
+test("computeCchForBody returns a 5-char hex token", () => {
+  const body = serializeBody({
+    system: [{ type: "text", text: "x" }],
+    messages: [{ role: "user", content: "hi" }],
+  });
+  const cch = computeCchForBody(body, CC_VERSION);
+  assert.match(cch, /^[0-9a-f]{5}$/);
+});
+
+test("computeCchForBody is deterministic", () => {
+  const body = serializeBody({ messages: [{ role: "user", content: "hi" }] });
+  assert.equal(
+    computeCchForBody(body, CC_VERSION),
+    computeCchForBody(body, CC_VERSION),
+  );
+});
+
+test("computeCchForBody masks to the lower 20 bits", () => {
+  const cch = computeCchForBody(
+    serializeBody({ messages: [{ role: "user", content: "prompt" }] }),
+    CC_VERSION,
+  );
+  const parsed = parseInt(cch, 16);
+  assert.ok(
+    parsed >= 0 && parsed <= 0xfffff,
+    `cch out of 20-bit range: ${cch}`,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// applyAnthropicBilling — the orchestrator
+// ---------------------------------------------------------------------------
+
+const HEADER_RE =
+  /^cc_version=2\.1\.196\.[0-9a-f]{3}; cc_entrypoint=cli; cch=[0-9a-f]{5};$/;
+
+test("applyAnthropicBilling returns a well-formed header value", () => {
+  const { header } = applyAnthropicBilling({
+    messages: [{ role: "user", content: "Hello world from a test prompt" }],
+  });
+  assert.match(header, HEADER_RE);
+  assert.ok(!/cch=00000;/.test(header), "cch must not be the placeholder");
+});
+
+test("applyAnthropicBilling rebuilds system[] as [billing, identity, ...]", () => {
+  const { body, header } = applyAnthropicBilling({
+    messages: [{ role: "user", content: "Hello" }],
+  });
+  const sys = body.system as Array<{ type: string; text: string }>;
+  assert.ok(Array.isArray(sys));
+  assert.equal(sys[0].text, `x-anthropic-billing-header: ${header}`);
+  assert.deepEqual(sys[1], { type: "text", text: CLAUDE_CODE_IDENTITY_TEXT });
+});
+
+test("applyAnthropicBilling preserves original system blocks after identity", () => {
+  const { body } = applyAnthropicBilling({
+    system: "Original system prompt",
+    messages: [{ role: "user", content: "Hello" }],
+  });
+  const sys = body.system as Array<{ type: string; text: string }>;
+  assert.equal(sys.length, 3);
+  assert.ok(sys[0].text.startsWith("x-anthropic-billing-header:"));
+  assert.equal(sys[1].text, CLAUDE_CODE_IDENTITY_TEXT);
+  assert.equal(sys[2].text, "Original system prompt");
+});
+
+test("applyAnthropicBilling preserves cache_control on non-identity original blocks", () => {
+  const { body } = applyAnthropicBilling({
     system: [
-      { type: "text", text: "x-anthropic-billing-header: OLD VALUE" },
       {
         type: "text",
-        text: "You are Claude Code.",
+        text: "Tool instructions",
         cache_control: { type: "ephemeral" },
       },
     ],
-  };
-  const text = computeBillingHeader("hey");
-  injectBillingHeader(body, text);
+    messages: [{ role: "user", content: "Hello" }],
+  });
   const sys = body.system as Array<{ type: string; text: string }>;
-  assert.equal(sys.length, 2);
-  assert.equal(sys[0].text, text);
-  assert.ok(!sys[0].text.includes("OLD VALUE"));
-  assert.equal(sys[1].text, "You are Claude Code.");
+  assert.equal(sys.length, 3);
+  assert.deepEqual(sys[2], {
+    type: "text",
+    text: "Tool instructions",
+    cache_control: { type: "ephemeral" },
+  });
 });
 
-test("injectBillingHeader strips cache_control from replaced billing block", () => {
-  const body: Record<string, unknown> = {
-    system: [
+test("applyAnthropicBilling does not duplicate an existing identity block", () => {
+  const { body } = applyAnthropicBilling({
+    system: [{ type: "text", text: CLAUDE_CODE_IDENTITY_TEXT }],
+    messages: [{ role: "user", content: "Hello" }],
+  });
+  const sys = body.system as Array<{ type: string; text: string }>;
+  const identityCount = sys.filter(
+    (s) => s.text === CLAUDE_CODE_IDENTITY_TEXT,
+  ).length;
+  assert.equal(identityCount, 1);
+});
+
+test("applyAnthropicBilling is idempotent on a second pass", () => {
+  const first = applyAnthropicBilling({
+    system: "You are a helpful assistant.",
+    messages: [{ role: "user", content: "Hello" }],
+  });
+  const second = applyAnthropicBilling(first.body);
+  assert.equal(first.header, second.header);
+});
+
+test("applyAnthropicBilling derives the reference version suffix for a known message", () => {
+  const expected = sha256(`59cf53e54c78oo0${CC_VERSION}`).slice(0, 3);
+  const { header } = applyAnthropicBilling({
+    messages: [{ role: "user", content: "hello world" }],
+  });
+  assert.ok(header.includes(`.${expected};`), `header: ${header}`);
+});
+
+test("applyAnthropicBilling cch is invariant to model/max_tokens (preimage transform)", () => {
+  const a = applyAnthropicBilling({
+    model: "claude-sonnet-4-20250514",
+    max_tokens: 1024,
+    messages: [{ role: "user", content: "Hello world" }],
+  }).header;
+  const b = applyAnthropicBilling({
+    model: "claude-opus-4-6",
+    max_tokens: 4096,
+    messages: [{ role: "user", content: "Hello world" }],
+  }).header;
+  const aCch = a.match(/cch=([0-9a-f]{5})/)![1];
+  const bCch = b.match(/cch=([0-9a-f]{5})/)![1];
+  assert.equal(aCch, bCch, "cch must match when only model/max_tokens differ");
+});
+
+test("applyAnthropicBilling cch changes when the first user text changes", () => {
+  const a = applyAnthropicBilling({
+    messages: [{ role: "user", content: "Hello world from a test prompt" }],
+  }).header;
+  const b = applyAnthropicBilling({
+    messages: [{ role: "user", content: "A completely different prompt" }],
+  }).header;
+  assert.notEqual(
+    a.match(/cch=([0-9a-f]{5})/)![1],
+    b.match(/cch=([0-9a-f]{5})/)![1],
+  );
+});
+
+test("applyAnthropicBilling honors PROXY_CCH_VALUE override", () => {
+  process.env["PROXY_CCH_VALUE"] = "fa690";
+  const { header } = applyAnthropicBilling({
+    messages: [{ role: "user", content: "hi" }],
+  });
+  assert.match(header, /; cch=fa690;$/);
+});
+
+test("applyAnthropicBilling strips cch= prefix from PROXY_CCH_VALUE", () => {
+  process.env["PROXY_CCH_VALUE"] = "cch=abc12";
+  const { header } = applyAnthropicBilling({
+    messages: [{ role: "user", content: "hi" }],
+  });
+  assert.match(header, /; cch=abc12;$/);
+});
+
+test("applyAnthropicBilling ignores an invalid PROXY_CCH_VALUE", () => {
+  process.env["PROXY_CCH_VALUE"] = "nothex";
+  const { header } = applyAnthropicBilling({
+    messages: [{ role: "user", content: "hi" }],
+  });
+  assert.match(header, /; cch=[0-9a-f]{5};$/);
+  assert.ok(!/; cch=nothex;$/.test(header));
+});
+
+test("applyAnthropicBilling honors PROXY_CC_VERSION override", () => {
+  process.env["PROXY_CC_VERSION"] = "2.1.999";
+  const { header } = applyAnthropicBilling({
+    messages: [{ role: "user", content: "hi" }],
+  });
+  assert.match(
+    header,
+    /^cc_version=2\.1\.999\.[0-9a-f]{3}; cc_entrypoint=cli; cch=[0-9a-f]{5};$/,
+  );
+});
+
+test("applyAnthropicBilling scrubs opencode fingerprints from system[]", () => {
+  const { body } = applyAnthropicBilling({
+    system:
+      "You are OpenCode, the best coding agent on the planet. " +
+      "Workspace root folder: /foo. Is directory a git repo: yes. " +
+      "See https://github.com/anomalyco/opencode",
+    messages: [{ role: "user", content: "Hello" }],
+  });
+  const sys = body.system as Array<{ type: string; text: string }>;
+  const allText = sys.map((s) => s.text).join("\n");
+  assert.ok(!allText.includes("anomalyco"));
+  assert.ok(!allText.includes("OpenCode"));
+  assert.ok(!allText.includes("Workspace root folder:"));
+  assert.ok(allText.includes("Working directory:"));
+  assert.ok(allText.includes("Git repository:"));
+});
+
+test("applyAnthropicBilling scrubs fingerprints from messages[] too", () => {
+  const { body } = applyAnthropicBilling({
+    system: "You are Claude Code.",
+    messages: [
       {
-        type: "text",
-        text: "x-anthropic-billing-header: OLD",
-        cache_control: { type: "ephemeral" },
+        role: "user",
+        content:
+          "Previous: Workspace root folder: /home. See https://github.com/anomalyco/opencode.",
       },
     ],
-  };
-  const text = computeBillingHeader("hey");
-  injectBillingHeader(body, text);
-  const sys = body.system as Array<Record<string, unknown>>;
-  assert.equal(sys[0].text, text);
-  assert.equal(sys[0].cache_control, undefined, "cache_control must be stripped");
+  });
+  const allText = JSON.stringify(body.messages);
+  assert.ok(!allText.includes("anomalyco"));
+  assert.ok(!allText.includes("Workspace root folder:"));
+  assert.ok(allText.includes("Working directory:"));
+  assert.ok(allText.includes("github.com/anthropics/claude-code"));
 });
 
-test("injectBillingHeader does not duplicate the billing block on repeat calls", () => {
-  const body: Record<string, unknown> = { model: "claude-sonnet-4-6" };
-  injectBillingHeader(body, computeBillingHeader("a"));
-  injectBillingHeader(body, computeBillingHeader("b"));
+test("applyAnthropicBilling renames native tool names to PascalCase", () => {
+  const { body } = applyAnthropicBilling({
+    system: "You are Claude Code.",
+    messages: [{ role: "user", content: "Hi" }],
+    tools: [
+      { name: "read", description: "Read", input_schema: { type: "object" } },
+      { name: "bash", description: "Run", input_schema: { type: "object" } },
+    ],
+    tool_choice: { type: "tool", name: "read" },
+  });
+  const tools = body.tools as Array<{ name: string }>;
+  assert.equal(tools[0].name, "Read");
+  assert.equal(tools[1].name, "Bash");
+  const choice = body.tool_choice as { name: string };
+  assert.equal(choice.name, "Read");
+});
+
+test("PROXY_CC_NORMALIZE_TOOLS=false leaves tool names untouched", () => {
+  process.env["PROXY_CC_NORMALIZE_TOOLS"] = "false";
+  const { body } = applyAnthropicBilling({
+    system: "You are Claude Code.",
+    messages: [{ role: "user", content: "Hi" }],
+    tools: [{ name: "read", description: "" }],
+  });
+  const tools = body.tools as Array<{ name: string }>;
+  assert.equal(tools[0].name, "read");
+});
+
+// ---------------------------------------------------------------------------
+// Tool-name PascalCasing (every non-mcp_ tool) + schema safety
+// ---------------------------------------------------------------------------
+
+test("applyAnthropicBilling PascalCases arbitrary non-mcp_ tool names", () => {
+  const { body } = applyAnthropicBilling({
+    system: "You are Claude Code.",
+    messages: [{ role: "user", content: "Hi" }],
+    tools: [
+      {
+        name: "get_user_profile",
+        description: "d",
+        input_schema: { type: "object" },
+      },
+      {
+        name: "search-index",
+        description: "d",
+        input_schema: { type: "object" },
+      },
+      {
+        name: "camelCaseThing",
+        description: "d",
+        input_schema: { type: "object" },
+      },
+    ],
+  });
+  const names = (body.tools as Array<{ name: string }>).map((t) => t.name);
+  assert.ok(names.includes("GetUserProfile"), `got: ${names.join(",")}`);
+  assert.ok(names.includes("SearchIndex"));
+  assert.ok(names.includes("CamelCaseThing"));
+});
+
+test("applyAnthropicBilling leaves mcp_ tool names untouched", () => {
+  const { body } = applyAnthropicBilling({
+    system: "You are Claude Code.",
+    messages: [{ role: "user", content: "Hi" }],
+    tools: [
+      {
+        name: "mcp__github__create_issue",
+        description: "d",
+        input_schema: { type: "object" },
+      },
+    ],
+  });
+  const names = (body.tools as Array<{ name: string }>).map((t) => t.name);
+  assert.ok(names.includes("mcp__github__create_issue"));
+});
+
+test("applyAnthropicBilling dedups tools that collide after renaming", () => {
+  const { body } = applyAnthropicBilling({
+    system: "You are Claude Code.",
+    messages: [{ role: "user", content: "Hi" }],
+    tools: [
+      { name: "read", description: "first", input_schema: { type: "object" } },
+      { name: "Read", description: "second", input_schema: { type: "object" } },
+    ],
+  });
+  const tools = body.tools as Array<{ name: string; description: string }>;
+  const reads = tools.filter((t) => t.name === "Read");
+  assert.equal(reads.length, 1, "colliding tool names must be deduped");
+  assert.equal(reads[0]!.description, "first");
+});
+
+test("applyAnthropicBilling renames tool_use and tool_choice consistently", () => {
+  const { body } = applyAnthropicBilling({
+    system: "You are Claude Code.",
+    messages: [
+      {
+        role: "assistant",
+        content: [
+          { type: "tool_use", id: "tu_1", name: "get_user", input: {} },
+        ],
+      },
+    ],
+    tools: [
+      { name: "get_user", description: "d", input_schema: { type: "object" } },
+    ],
+    tool_choice: { type: "tool", name: "get_user" },
+  });
+  const tools = body.tools as Array<{ name: string }>;
+  assert.ok(tools.some((t) => t.name === "GetUser"));
+  assert.equal((body.tool_choice as { name: string }).name, "GetUser");
+  const msg = (
+    body.messages as Array<{ content: Array<{ name?: string }> }>
+  )[0]!;
+  assert.equal(msg.content[0]!.name, "GetUser");
+});
+
+test("applyAnthropicBilling emits only schema-valid tool names", () => {
+  const { body } = applyAnthropicBilling({
+    system: "You are Claude Code.",
+    messages: [{ role: "user", content: "Hi" }],
+    tools: [
+      {
+        name: "weird.name+v2",
+        description: "d",
+        input_schema: { type: "object" },
+      },
+    ],
+  });
+  const names = (body.tools as Array<{ name: string }>).map((t) => t.name);
+  // Stripped to alphanumeric PascalCase; no dots/plus → Anthropic tool-name valid.
+  assert.ok(names.includes("WeirdNameV2"), `got: ${names.join(",")}`);
+  for (const n of names) assert.match(n, /^[A-Za-z0-9]{1,64}$/);
+});
+
+test("applyAnthropicBilling returns a reverse tool-rename map for responses", () => {
+  const { toolRenameMap } = applyAnthropicBilling({
+    system: "You are Claude Code.",
+    messages: [{ role: "user", content: "Hi" }],
+    tools: [
+      { name: "get_user", description: "d", input_schema: { type: "object" } },
+      { name: "bash", description: "d", input_schema: { type: "object" } },
+      {
+        name: "mcp__svc__thing",
+        description: "d",
+        input_schema: { type: "object" },
+      },
+    ],
+  });
+  assert.equal(toolRenameMap.get("GetUser"), "get_user");
+  assert.equal(toolRenameMap.get("Bash"), "bash");
+  // mcp_ tools are not renamed → not in the map.
+  assert.equal(toolRenameMap.get("mcp__svc__thing"), undefined);
+  // Decoy-only names (no client original) are not in the map.
+  assert.equal(toolRenameMap.get("Read"), undefined);
+});
+
+// ---------------------------------------------------------------------------
+// CC decoy tools fallback
+// ---------------------------------------------------------------------------
+
+test("applyAnthropicBilling injects decoys for every missing CC native tool", () => {
+  const { body } = applyAnthropicBilling({
+    system: "You are Claude Code.",
+    messages: [{ role: "user", content: "Hi" }],
+    tools: [{ name: "read", description: "real" }],
+  });
+  const tools = body.tools as Array<{ name: string; description: string }>;
+  const names = new Set(tools.map((t) => t.name));
+  // The supplied `Read` (renamed) is kept exactly once and NOT overwritten.
+  assert.equal([...names].filter((n) => n === "Read").length, 1);
+  assert.equal(tools.find((t) => t.name === "Read")!.description, "real");
+  // A representative sample of CC decoy names is present and unavailable.
+  for (const decoy of ["Agent", "Bash", "Grep", "Task", "Write", "Workflow"]) {
+    assert.ok(names.has(decoy), `missing decoy ${decoy}`);
+  }
+  assert.equal(
+    tools.find((t) => t.name === "Bash")!.description,
+    "This tool is currently unavailable.",
+  );
+});
+
+test("applyAnthropicBilling does not duplicate an already-supplied tool", () => {
+  const { body } = applyAnthropicBilling({
+    system: "You are Claude Code.",
+    messages: [{ role: "user", content: "Hi" }],
+    tools: [{ name: "Read", description: "real" }],
+  });
+  const tools = body.tools as Array<{ name: string }>;
+  assert.equal(tools.filter((t) => t.name === "Read").length, 1);
+});
+
+test("applyAnthropicBilling injects the full decoy set when no tools are supplied", () => {
+  const { body } = applyAnthropicBilling({
+    system: "You are Claude Code.",
+    messages: [{ role: "user", content: "Hi" }],
+  });
+  const tools = body.tools as Array<{ name: string; description: string }>;
+  assert.ok(tools.length >= 30);
+  for (const t of tools) {
+    assert.equal(t.description, "This tool is currently unavailable.");
+  }
+});
+
+test("PROXY_CC_DECOY_TOOLS=false disables decoy injection", () => {
+  process.env["PROXY_CC_DECOY_TOOLS"] = "false";
+  const { body } = applyAnthropicBilling({
+    system: "You are Claude Code.",
+    messages: [{ role: "user", content: "Hi" }],
+  });
+  assert.equal(body.tools, undefined, "no decoys should be injected");
+});
+
+test("applyAnthropicBilling preserves system[] order [billing, identity, scrubbed...]", () => {
+  const { body } = applyAnthropicBilling({
+    system: "Workspace root folder: /foo",
+    messages: [{ role: "user", content: "Hi" }],
+  });
   const sys = body.system as Array<{ type: string; text: string }>;
-  assert.equal(sys.length, 1);
-  assert.ok(sys[0].text.includes("cch="));
+  assert.ok(sys[0].text.startsWith("x-anthropic-billing-header:"));
+  assert.equal(sys[1].text, CLAUDE_CODE_IDENTITY_TEXT);
+  assert.ok(sys[2].text.includes("Working directory:"));
 });

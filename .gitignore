@@ -6,6 +6,7 @@ package-lock.json
 dist/
 
 # Environment and secrets
+.claude
 .env
 .env.*
 *.pem

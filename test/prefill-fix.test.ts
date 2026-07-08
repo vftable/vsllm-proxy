@@ -23,10 +23,17 @@ test("modelNeedsFix does not match older Claude models", () => {
   assert.ok(!modelNeedsFix("gpt-4o"));
 });
 
-test("modelNeedsFix does not false-positive on 4-55 or 4-50", () => {
-  assert.ok(!modelNeedsFix("claude-sonnet-4-55"));
-  assert.ok(!modelNeedsFix("claude-opus-4-50"));
-  assert.ok(!modelNeedsFix("claude-sonnet-4-55-20260101"));
+test("modelNeedsFix matches two-digit minor versions (4-10, 4-55)", () => {
+  assert.ok(modelNeedsFix("claude-sonnet-4-10"));
+  assert.ok(modelNeedsFix("claude-sonnet-4-55"));
+  assert.ok(modelNeedsFix("claude-opus-4-50"));
+  assert.ok(modelNeedsFix("claude-sonnet-4-55-20260101"));
+});
+
+test("modelNeedsFix matches claude-fable and claude-mythos", () => {
+  assert.ok(modelNeedsFix("claude-fable"));
+  assert.ok(modelNeedsFix("claude-fable-5-20260101"));
+  assert.ok(modelNeedsFix("claude-mythos"));
 });
 
 test("buildUserMessage returns a plain continue when no tool_use", () => {

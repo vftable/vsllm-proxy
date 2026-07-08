@@ -1,10 +1,17 @@
 import type { PrefillBody } from "./types.js";
 
+// Models that require the prefill auto-fix (a trailing assistant turn must be
+// followed by a synthetic user "continue" turn). Only `claude-` models ever
+// match — non-Claude models (gpt-*, gemini-*, ollama, ...) are never touched.
+//
+//   - claude-{sonnet,opus,haiku}-4-<N>   where N is 6-9 or two+ digits (4.6+)
+//   - claude-{sonnet,opus,haiku}-<N>     where N is 5-9 or two+ digits (5+)
+//   - claude-fable / claude-mythos       (any version)
 const NO_PREFILL_RE =
-  /(?:^claude-(?:sonnet|opus|haiku)-4-[6-9](?:-\d{8})?$)|(?:^claude-(?:sonnet|opus|haiku)-[5-9](?:-\d{8})?$)|(?:^claude-(?:sonnet|opus|haiku)-(?:[5-9]|\d{2,})-)|(?:^claude-mythos$)/;
+  /claude-(?:sonnet|opus|haiku)-4-([6-9]|\d{2,})(?:-|$)|claude-(?:sonnet|opus|haiku)-([5-9]|\d{2,})(?:-|$)|claude-(?:fable|mythos)/i;
 
 export function modelNeedsFix(model: unknown): boolean {
-  return typeof model === "string" && NO_PREFILL_RE.test(model.toLowerCase());
+  return typeof model === "string" && NO_PREFILL_RE.test(model);
 }
 
 export function extractToolUseIds(content: unknown): string[] {
@@ -23,8 +30,7 @@ export function extractToolUseIds(content: unknown): string[] {
 export function buildUserMessage(content: unknown): {
   role: string;
   content:
-    | string
-    | Array<{ type: string; tool_use_id: string; content: string }>;
+    string | Array<{ type: string; tool_use_id: string; content: string }>;
 } {
   const toolIds = extractToolUseIds(content);
   if (toolIds.length) {

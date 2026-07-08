@@ -3,10 +3,16 @@ import * as path from "node:path";
 import { URL } from "node:url";
 import { execSync } from "node:child_process";
 import type { ProxyConfig, CreateProxyOpts } from "./types.js";
+import { CC_VERSION } from "./billing.js";
 
 const CLAUDE_CODE_BETA_FLAGS = [
   "claude-code-20250219",
+  // oauth-2025-04-20 enables OAuth bearer-token auth on /v1/messages and is
+  // required for the subscription billing path; fine-grained-tool-streaming is
+  // part of Claude Code's current OAuth beta header set.
+  "oauth-2025-04-20",
   "interleaved-thinking-2025-05-14",
+  "fine-grained-tool-streaming-2025-05-14",
   // "redact-thinking-2026-02-12",
   "thinking-token-count-2026-05-13",
   "context-management-2025-06-27",
@@ -46,7 +52,7 @@ function buildDefaultUpstreamHeaders(): Record<string, string> {
 
   // this is for claude oauth antiban. hi. they check the billing header now. okay
   return {
-    "user-agent": `claude-cli/2.1.37 (external, cli)`,
+    "user-agent": `claude-cli/${CC_VERSION} (external, cli)`,
     "x-app": "cli",
     "x-stainless-runtime": "node",
     "x-stainless-runtime-version": nodeVersion,
@@ -105,8 +111,7 @@ export function resolveConfig(opts: CreateProxyOpts = {}): ProxyConfig {
     port: parseInt(String(pick("port", 0)), 10) || null,
     upstreamBaseUrl: upstreamBase,
     upstreamApiKey: pick("upstreamApiKey", DEFAULTS.upstreamApiKey) as
-      | string
-      | string[],
+      string | string[],
     upstreamHost: String(
       pick("upstreamHost", "") || new URL(upstreamBase).host,
     ),

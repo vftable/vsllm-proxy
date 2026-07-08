@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert";
 import http from "node:http";
+import { createHash } from "node:crypto";
 import {
   createProxyServer,
   route,
@@ -642,8 +643,7 @@ test("e2e: client-supplied headers take precedence over config defaults", async 
       upstreamHandler: async (req, res) => {
         customHdr = req.headers["x-custom-hdr"] as string | undefined;
         anthropicVersion = req.headers["anthropic-version"] as
-          | string
-          | undefined;
+          string | undefined;
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ ok: true }));
       },
@@ -1469,8 +1469,7 @@ test("e2e: /v1/messages overwrites metadata and sets anthropic-version header", 
   const { proxy, upstream } = await boot({
     upstreamHandler: async (req, res) => {
       sessionHeader = req.headers["x-claude-code-session-id"] as
-        | string
-        | undefined;
+        string | undefined;
       const chunks: Buffer[] = [];
       for await (const c of req) chunks.push(c as Buffer);
       captured = JSON.parse(Buffer.concat(chunks).toString() || "{}");
@@ -1557,7 +1556,7 @@ test("e2e: /v1/messages injects billing header as first system block", async () 
         system: [
           {
             type: "text",
-            text: "You are Claude Code, Anthropic's official CLI for Claude.",
+            text: "You are a careful assistant.",
             cache_control: { type: "ephemeral" },
           },
         ],
@@ -1565,19 +1564,23 @@ test("e2e: /v1/messages injects billing header as first system block", async () 
     });
     assert.ok(Array.isArray(captured.system), "system must be an array");
     const sys = captured.system as Array<{ type: string; text: string }>;
+    // v0.6.0 order: [billing, identity, ...original]
+    assert.equal(sys.length, 3);
     assert.ok(
       sys[0].text.startsWith("x-anthropic-billing-header:"),
       `first block must be billing header, got: ${sys[0].text}`,
     );
     assert.ok(sys[0].text.includes("cc_version="));
     assert.ok(sys[0].text.includes("cc_entrypoint=cli"));
-    // Original system block preserved.
-    assert.equal(sys.length, 2);
-    assert.ok(sys[1].text.includes("You are Claude Code"));
-    assert.deepEqual(
-      (sys[1] as { cache_control?: unknown }).cache_control,
-      { type: "ephemeral" },
+    assert.equal(
+      sys[1].text,
+      "You are Claude Code, Anthropic's official CLI for Claude.",
     );
+    // Original (non-identity) block preserved with its cache_control.
+    assert.equal(sys[2].text, "You are a careful assistant.");
+    assert.deepEqual((sys[2] as { cache_control?: unknown }).cache_control, {
+      type: "ephemeral",
+    });
   } finally {
     await close(proxy);
     await close(upstream);
@@ -1617,8 +1620,9 @@ test("e2e: /v1/messages replaces an existing billing header from the client", as
       },
     });
     const sys = captured.system as Array<{ type: string; text: string }>;
-    // Should still be two blocks (replaced, not duplicated).
-    assert.equal(sys.length, 2);
+    // Client billing block stripped (replaced, not duplicated); identity
+    // inserted at [1]; the non-identity "You are Claude Code." block preserved.
+    assert.equal(sys.length, 3);
     assert.ok(
       sys[0].text.startsWith("x-anthropic-billing-header:"),
       "first block must be billing header",
@@ -1628,6 +1632,17 @@ test("e2e: /v1/messages replaces an existing billing header from the client", as
       !sys[0].text.includes("LEGITIMATE_CLIENT_VALUE"),
       `client billing value must be replaced, got: ${sys[0].text}`,
     );
+    // Exactly one billing block survives.
+    assert.equal(
+      sys.filter((s) => s.text.startsWith("x-anthropic-billing-header:"))
+        .length,
+      1,
+    );
+    assert.equal(
+      sys[1].text,
+      "You are Claude Code, Anthropic's official CLI for Claude.",
+    );
+    assert.equal(sys[2].text, "You are Claude Code.");
   } finally {
     await close(proxy);
     await close(upstream);
@@ -1658,9 +1673,13 @@ test("e2e: /v1/messages converts string system to array with billing header", as
     });
     const sys = captured.system as Array<{ type: string; text: string }>;
     assert.ok(Array.isArray(sys));
-    assert.equal(sys.length, 2);
+    assert.equal(sys.length, 3);
     assert.ok(sys[0].text.startsWith("x-anthropic-billing-header:"));
-    assert.equal(sys[1].text, "You are Claude Code.");
+    assert.equal(
+      sys[1].text,
+      "You are Claude Code, Anthropic's official CLI for Claude.",
+    );
+    assert.equal(sys[2].text, "You are Claude Code.");
   } finally {
     await close(proxy);
     await close(upstream);
@@ -1692,7 +1711,7 @@ test("e2e: billing header is not injected for non-messages endpoints", async () 
   }
 });
 
-test("e2e: /v1/messages billing header matches spec test vector for 'hey'", async () => {
+test("e2e: /v1/messages billing header matches v0.6.0 spec for 'hey'", async () => {
   let captured: any;
   const { proxy, upstream } = await boot({
     upstreamHandler: async (req, res) => {
@@ -1716,20 +1735,240 @@ test("e2e: /v1/messages billing header matches spec test vector for 'hey'", asyn
     const sys = captured.system as Array<{ type: string; text: string }>;
     assert.ok(Array.isArray(sys));
     const billing = sys[0].text;
-    // Exact spec test vector: message "hey" -> cc_version=2.1.37.0d9, cch=fa690
+    // "hey" (length 3) samples "000"; suffix = sha256("59cf53e54c780002.1.196")[:3].
+    const expectedSuffix = createHash("sha256")
+      .update("59cf53e54c780002.1.196", "utf8")
+      .digest("hex")
+      .slice(0, 3);
     assert.ok(
-      billing.includes("cc_version=2.1.37.0d9;"),
+      billing.includes(`cc_version=2.1.196.${expectedSuffix};`),
       `cc_version mismatch: ${billing}`,
     );
-    assert.ok(
-      billing.includes("cch=fa690;"),
-      `cch mismatch: ${billing}`,
-    );
     assert.ok(billing.includes("cc_entrypoint=cli;"));
+    assert.match(billing, /cch=[0-9a-f]{5};/);
     // Billing block must not carry cache_control.
     assert.equal(
       (sys[0] as { cache_control?: unknown }).cache_control,
       undefined,
+    );
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test("e2e: /v1/messages sets x-anthropic-billing-header and ?beta=true upstream", async () => {
+  let billingHeader: string | undefined;
+  let hitPath: string | undefined;
+  const { proxy, upstream } = await boot({
+    upstreamHandler: async (req, res) => {
+      billingHeader = req.headers["x-anthropic-billing-header"] as
+        string | undefined;
+      hitPath = req.url;
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+    },
+  });
+
+  try {
+    const port = (proxy.address() as { port: number }).port;
+    await proxyRequest(port, {
+      path: "/v1/messages",
+      body: {
+        model: "claude-sonnet-4-6",
+        messages: [{ role: "user", content: "hi" }],
+      },
+    });
+    assert.ok(billingHeader, "x-anthropic-billing-header must be set upstream");
+    assert.match(
+      billingHeader!,
+      /^cc_version=2\.1\.196\.[0-9a-f]{3}; cc_entrypoint=cli; cch=[0-9a-f]{5};$/,
+    );
+    assert.ok(
+      hitPath?.includes("/v1/messages?beta=true"),
+      `upstream path must include ?beta=true, got: ${hitPath}`,
+    );
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test("e2e: x-anthropic-billing-header is not sent for non-messages endpoints", async () => {
+  let billingHeader: string | undefined;
+  const { proxy, upstream } = await boot({
+    upstreamHandler: async (req, res) => {
+      billingHeader = req.headers["x-anthropic-billing-header"] as
+        string | undefined;
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+    },
+  });
+
+  try {
+    const port = (proxy.address() as { port: number }).port;
+    await proxyRequest(port, {
+      path: "/v1/chat/completions",
+      body: { model: "gpt-4o", messages: [{ role: "user", content: "hi" }] },
+    });
+    assert.equal(
+      billingHeader,
+      undefined,
+      "billing header must not leak to non-messages endpoints",
+    );
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test("e2e: /v1/messages forwards the CC decoy tools upstream when none are supplied", async () => {
+  let captured: any;
+  const { proxy, upstream } = await boot({
+    upstreamHandler: async (req, res) => {
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      captured = JSON.parse(Buffer.concat(chunks).toString() || "{}");
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+    },
+  });
+
+  try {
+    const port = (proxy.address() as { port: number }).port;
+    await proxyRequest(port, {
+      path: "/v1/messages",
+      body: {
+        model: "claude-sonnet-4-6",
+        messages: [{ role: "user", content: "hi" }],
+      },
+    });
+    const tools = captured.tools as Array<{
+      name: string;
+      description: string;
+    }>;
+    assert.ok(Array.isArray(tools), "tools[] must be injected upstream");
+    const names = new Set(tools.map((t) => t.name));
+    assert.ok(names.has("Bash"), "Bash decoy missing");
+    assert.ok(names.has("Read"), "Read decoy missing");
+    assert.ok(names.has("Agent"), "Agent decoy missing");
+    // Every injected tool is a marked-unavailable decoy.
+    for (const t of tools) {
+      assert.equal(t.description, "This tool is currently unavailable.");
+    }
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test("e2e: /v1/messages maps tool_use names in JSON responses back to client names", async () => {
+  let captured: any;
+  const { proxy, upstream } = await boot({
+    upstreamHandler: async (req, res) => {
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      captured = JSON.parse(Buffer.concat(chunks).toString() || "{}");
+      // Upstream sees the renamed tool; respond with a tool_use using it.
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          id: "msg_1",
+          type: "message",
+          role: "assistant",
+          content: [
+            { type: "text", text: "ok" },
+            {
+              type: "tool_use",
+              id: "toolu_1",
+              name: "GetUser",
+              input: { q: 1 },
+            },
+          ],
+          stop_reason: "tool_use",
+        }),
+      );
+    },
+  });
+
+  try {
+    const port = (proxy.address() as { port: number }).port;
+    const out = await proxyRequest(port, {
+      path: "/v1/messages",
+      body: {
+        model: "claude-sonnet-4-6",
+        messages: [{ role: "user", content: "hi" }],
+        tools: [
+          {
+            name: "get_user",
+            description: "d",
+            input_schema: { type: "object" },
+          },
+        ],
+      },
+    });
+    // Upstream received the renamed tool name.
+    const upTools = captured.tools as Array<{ name: string }>;
+    assert.ok(upTools.some((t) => t.name === "GetUser"));
+    // Client receives the ORIGINAL tool name in the tool_use.
+    const resp = JSON.parse(out.body);
+    const tu = resp.content.find((b: any) => b.type === "tool_use");
+    assert.equal(tu.name, "get_user", `got: ${out.body}`);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test("e2e: /v1/messages maps tool_use names in SSE streams back to client names", async () => {
+  const { proxy, upstream } = await boot({
+    upstreamHandler: (req, res) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(
+        'event: message_start\ndata: {"type":"message_start","message":{"id":"m","role":"assistant","content":[],"stop_reason":null}}\n\n',
+      );
+      res.write(
+        'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"GetUser","input":{}}}\n\n',
+      );
+      res.write(
+        'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"q\\":1}"}}\n\n',
+      );
+      res.write(
+        'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+      );
+      res.write('event: message_stop\ndata: {"type":"message_stop"}\n\n');
+      res.end();
+    },
+  });
+
+  try {
+    const port = (proxy.address() as { port: number }).port;
+    const out = await proxyRequest(port, {
+      path: "/v1/messages",
+      body: {
+        model: "claude-sonnet-4-6",
+        messages: [{ role: "user", content: "hi" }],
+        stream: true,
+        tools: [
+          {
+            name: "get_user",
+            description: "d",
+            input_schema: { type: "object" },
+          },
+        ],
+      },
+    });
+    assert.ok(
+      out.body.includes('"name":"get_user"'),
+      `expected remapped name in stream: ${out.body}`,
+    );
+    assert.ok(
+      !out.body.includes('"name":"GetUser"'),
+      `upstream name leaked into stream: ${out.body}`,
     );
   } finally {
     await close(proxy);
