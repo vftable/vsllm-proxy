@@ -1827,6 +1827,8 @@ test("e2e: x-anthropic-billing-header is not sent for non-messages endpoints", a
 });
 
 test("e2e: /v1/messages forwards the CC decoy tools upstream when none are supplied", async () => {
+  const prevDecoys = process.env["PROXY_CC_DECOY_TOOLS"];
+  process.env["PROXY_CC_DECOY_TOOLS"] = "true"; // decoys default OFF in production
   let captured: any;
   const { proxy, upstream } = await boot({
     upstreamHandler: async (req, res) => {
@@ -1852,15 +1854,22 @@ test("e2e: /v1/messages forwards the CC decoy tools upstream when none are suppl
       description: string;
     }>;
     assert.ok(Array.isArray(tools), "tools[] must be injected upstream");
-    const names = new Set(tools.map((t) => t.name));
-    assert.ok(names.has("Bash"), "Bash decoy missing");
-    assert.ok(names.has("Read"), "Read decoy missing");
-    assert.ok(names.has("Agent"), "Agent decoy missing");
-    // Every injected tool is a marked-unavailable decoy.
-    for (const t of tools) {
-      assert.equal(t.description, "This tool is currently unavailable.");
-    }
+    const byName = new Map(tools.map((t) => [t.name, t]));
+    assert.ok(byName.has("Bash"), "Bash decoy missing");
+    assert.ok(byName.has("Read"), "Read decoy missing");
+    assert.ok(byName.has("Agent"), "Agent decoy missing");
+    // Most decoys are marked unavailable; WebSearch/WebFetch are callable.
+    assert.equal(
+      byName.get("Bash")!.description,
+      "This tool is currently unavailable.",
+    );
+    assert.notEqual(
+      byName.get("WebSearch")!.description,
+      "This tool is currently unavailable.",
+    );
   } finally {
+    if (prevDecoys === undefined) delete process.env["PROXY_CC_DECOY_TOOLS"];
+    else process.env["PROXY_CC_DECOY_TOOLS"] = prevDecoys;
     await close(proxy);
     await close(upstream);
   }

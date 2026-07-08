@@ -208,7 +208,11 @@ function dedupToolsByName(tools: unknown[]): unknown[] {
 export interface CcDecoyTool {
   readonly name: string;
   readonly description: string;
-  readonly input_schema: { type: string; properties: Record<string, unknown> };
+  readonly input_schema: {
+    type: string;
+    properties: Record<string, unknown>;
+    required?: string[];
+  };
 }
 
 export const CC_DECOY_TOOLS: readonly CcDecoyTool[] = [
@@ -352,15 +356,49 @@ export const CC_DECOY_TOOLS: readonly CcDecoyTool[] = [
     description: "This tool is currently unavailable.",
     input_schema: { type: "object", properties: {} },
   },
+  // WebFetch / WebSearch are kept CALLABLE (not "unavailable"): the gateway
+  // commonly declares only the server `web_search` tool but forces
+  // `tool_choice:{name:"WebSearch"}` (Claude Code's own PascalCase name). The
+  // forced call resolves to this injected definition, and Claude Code executes
+  // it client-side — so it must carry the real params (query / url+prompt) or
+  // the model emits an empty tool_use and the search returns 0 results.
   {
     name: "WebFetch",
-    description: "This tool is currently unavailable.",
-    input_schema: { type: "object", properties: {} },
+    description:
+      "Fetch content from a URL. Use `prompt` to describe what to extract from the page.",
+    input_schema: {
+      type: "object",
+      properties: {
+        url: { type: "string", description: "The URL to fetch." },
+        prompt: {
+          type: "string",
+          description: "What to extract or answer about the page.",
+        },
+      },
+      required: ["url", "prompt"],
+    },
   },
   {
     name: "WebSearch",
-    description: "This tool is currently unavailable.",
-    input_schema: { type: "object", properties: {} },
+    description:
+      "Search the web for current information. Returns fresh results from a search engine.",
+    input_schema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "The search query." },
+        allowed_domains: {
+          type: "array",
+          items: { type: "string" },
+          description: "Only include results from these domains.",
+        },
+        blocked_domains: {
+          type: "array",
+          items: { type: "string" },
+          description: "Exclude results from these domains.",
+        },
+      },
+      required: ["query"],
+    },
   },
   {
     name: "Workflow",
@@ -387,29 +425,27 @@ export function ensureCcDecoyTools(
   const tools = out["tools"];
   const list: unknown[] = Array.isArray(tools) ? tools : [];
 
-  // Match decoys against existing tools by a normalized key (lowercased, with
-  // non-alphanumerics stripped) so that a real tool suppresses its decoy even
-  // when the spelling differs — e.g. a client `web_search` server tool must
-  // suppress the `WebSearch` decoy, otherwise the model is offered both a
-  // working tool and a "currently unavailable" one with the same intent.
+  // Suppress a decoy only when a tool with the SAME name (case-insensitive) is
+  // already supplied. We deliberately do NOT fuzzy-match across spellings: a
+  // server `web_search` tool must NOT suppress the `WebSearch` decoy, because
+  // the conversation history can carry `WebSearch` tool_use blocks (Claude Code
+  // calls its tools by their PascalCase names) and Anthropic rejects any
+  // tool_use whose name isn't declared in `tools[]` with
+  // `Tool '<Name>' not found in provided tools`. Keeping both lets the model
+  // use the server tool while historical `WebSearch` references still resolve.
   const existing = new Set<string>();
   for (const t of list) {
     if (t && typeof t === "object" && !Array.isArray(t)) {
       const name = (t as Record<string, unknown>)["name"];
-      if (typeof name === "string") existing.add(decoyDedupKey(name));
+      if (typeof name === "string") existing.add(name.toLowerCase());
     }
   }
 
   const decoys = CC_DECOY_TOOLS.filter(
-    (d) => !existing.has(decoyDedupKey(d.name)),
+    (d) => !existing.has(d.name.toLowerCase()),
   ).map((d) => ({ ...d }));
   if (decoys.length === 0) return out;
 
   out["tools"] = [...list, ...decoys];
   return out;
-}
-
-/** Lowercase + strip non-alphanumerics, for fuzzy decoy de-duplication. */
-function decoyDedupKey(name: string): string {
-  return name.toLowerCase().replace(/[^a-z0-9]/g, "");
 }

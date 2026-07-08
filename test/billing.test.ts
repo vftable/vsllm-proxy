@@ -34,6 +34,8 @@ beforeEach(() => {
     snapshot[k] = process.env[k];
     delete process.env[k];
   }
+  // Decoys default OFF in production now; tests exercise the full pipeline.
+  process.env["PROXY_CC_DECOY_TOOLS"] = "true";
 });
 afterEach(() => {
   for (const k of ENV_KEYS) {
@@ -765,9 +767,13 @@ test("applyAnthropicBilling injects the full decoy set when no tools are supplie
   });
   const tools = body.tools as Array<{ name: string; description: string }>;
   assert.ok(tools.length >= 30);
-  for (const t of tools) {
-    assert.equal(t.description, "This tool is currently unavailable.");
-  }
+  // All decoys are marked unavailable EXCEPT the callable WebSearch/WebFetch.
+  const unavailable = tools.filter(
+    (t) => t.description === "This tool is currently unavailable.",
+  );
+  assert.equal(unavailable.length, tools.length - 2);
+  assert.ok(tools.some((t) => t.name === "WebSearch"));
+  assert.ok(tools.some((t) => t.name === "WebFetch"));
 });
 
 test("PROXY_CC_DECOY_TOOLS=false disables decoy injection", () => {
@@ -779,10 +785,38 @@ test("PROXY_CC_DECOY_TOOLS=false disables decoy injection", () => {
   assert.equal(body.tools, undefined, "no decoys should be injected");
 });
 
-test("a web_search server tool suppresses the WebSearch decoy (no duplicate)", () => {
-  // `web_search` (server) and `WebSearch` (decoy) differ in spelling but have
-  // the same intent; both present confuses the model into calling the
-  // unavailable decoy. Alphanumeric-normalized dedup must collapse them.
+test("a web_search server tool does NOT suppress the WebSearch decoy", () => {
+  // Claude Code calls its tools by PascalCase names: it sends
+  // `tool_choice:{type:"tool",name:"WebSearch"}` and its history carries
+  // `WebSearch` tool_use blocks, even when the server `web_search` tool is also
+  // declared. Anthropic rejects any tool_use / tool_choice name not present in
+  // `tools[]` ("Tool 'WebSearch' not found in provided tools"), so the decoy
+  // must stay to keep that reference valid. Decoys are only suppressed on an
+  // exact (case-insensitive) name match, never a fuzzy one.
+  const { body } = applyAnthropicBilling({
+    system: "You are Claude Code.",
+    messages: [{ role: "user", content: "Hi" }],
+    tools: [
+      {
+        type: "web_search_20250305",
+        name: "web_search",
+      } as unknown as Record<string, unknown>,
+    ],
+    tool_choice: { type: "tool", name: "WebSearch" },
+  });
+  const tools = body.tools as Array<{ name: string; type?: string }>;
+  const names = tools.map((t) => t.name);
+  // Both the real server tool AND the WebSearch decoy are present.
+  assert.ok(names.includes("web_search"), "server web_search must be present");
+  assert.ok(names.includes("WebSearch"), "WebSearch decoy must be retained");
+  // tool_choice is left as the client sent it (still resolves, via the decoy).
+  assert.deepEqual(body.tool_choice, { type: "tool", name: "WebSearch" });
+});
+
+test("the injected WebSearch is callable and carries a required `query`", () => {
+  // A forced `tool_choice:WebSearch` resolves to this injected definition; it
+  // must declare `query` (and WebFetch `url`+`prompt`) or the model emits an
+  // empty tool_use and the client-side search returns 0 results.
   const { body } = applyAnthropicBilling({
     system: "You are Claude Code.",
     messages: [{ role: "user", content: "Hi" }],
@@ -793,39 +827,15 @@ test("a web_search server tool suppresses the WebSearch decoy (no duplicate)", (
       } as unknown as Record<string, unknown>,
     ],
   });
-  const tools = body.tools as Array<{ name: string; type?: string }>;
-  // Exactly one web-search-ish tool: the real server tool.
-  const wsLike = tools.filter((t) =>
-    t.name
-      .toLowerCase()
-      .replace(/[^a-z0-9]/g, "")
-      .includes("websearch"),
-  );
-  assert.equal(wsLike.length, 1, `got: ${JSON.stringify(wsLike)}`);
-  assert.equal(wsLike[0]!.name, "web_search");
-  assert.equal(wsLike[0]!.type, "web_search_20250305");
-});
-
-test("a web_fetch server tool suppresses the WebFetch decoy", () => {
-  const { body } = applyAnthropicBilling({
-    system: "You are Claude Code.",
-    messages: [{ role: "user", content: "Hi" }],
-    tools: [
-      {
-        type: "web_fetch_20250305",
-        name: "web_fetch",
-      } as unknown as Record<string, unknown>,
-    ],
-  });
-  const tools = body.tools as Array<{ name: string }>;
-  const wfLike = tools.filter((t) =>
-    t.name
-      .toLowerCase()
-      .replace(/[^a-z0-9]/g, "")
-      .includes("webfetch"),
-  );
-  assert.equal(wfLike.length, 1, `got: ${JSON.stringify(wfLike)}`);
-  assert.equal(wfLike[0]!.name, "web_fetch");
+  const tools = body.tools as Array<{
+    name: string;
+    input_schema: { properties: Record<string, unknown>; required?: string[] };
+  }>;
+  const ws = tools.find((t) => t.name === "WebSearch")!;
+  assert.deepEqual(ws.input_schema.required, ["query"]);
+  assert.ok("query" in ws.input_schema.properties);
+  const wf = tools.find((t) => t.name === "WebFetch")!;
+  assert.deepEqual(wf.input_schema.required, ["url", "prompt"]);
 });
 
 test("applyAnthropicBilling preserves system[] order [billing, identity, scrubbed...]", () => {
