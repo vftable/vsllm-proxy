@@ -1866,6 +1866,52 @@ test("e2e: /v1/messages forwards the CC decoy tools upstream when none are suppl
   }
 });
 
+test("e2e: /v1/messages logs the upstream tool set and tool_choice", async () => {
+  const logs: string[] = [];
+  const origLog = console.log;
+  console.log = (...args: any[]) => void logs.push(args.join(" "));
+  const { proxy, upstream } = await boot({
+    upstreamHandler: async (req, res) => {
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+    },
+  });
+
+  try {
+    const port = (proxy.address() as { port: number }).port;
+    await proxyRequest(port, {
+      path: "/v1/messages",
+      body: {
+        model: "claude-sonnet-4-6",
+        messages: [{ role: "user", content: "hi" }],
+        tools: [
+          { name: "webfetch", description: "d", input_schema: { type: "object" } },
+          { name: "websearch", description: "d", input_schema: { type: "object" } },
+          {
+            type: "web_search_20250305",
+            name: "web_search",
+          } as any,
+        ],
+        tool_choice: { type: "tool", name: "websearch" },
+      },
+    });
+    const line = logs.find((l) => l.includes("upstream-tools"));
+    assert.ok(line, `expected an upstream-tools log line, got: ${logs.join(" | ")}`);
+    // Renamed user tools appear bare; server tool appears with its type tag.
+    assert.ok(line!.includes("WebFetch"), line);
+    assert.ok(line!.includes("WebSearch"), line);
+    assert.ok(line!.includes("web_search:web_search_20250305"), line);
+    // tool_choice reflects the renamed name.
+    assert.ok(line!.includes("tool:WebSearch"), line);
+  } finally {
+    console.log = origLog;
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
 test("e2e: /v1/messages maps tool_use names in JSON responses back to client names", async () => {
   let captured: any;
   const { proxy, upstream } = await boot({

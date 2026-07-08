@@ -447,6 +447,39 @@ class SseToolNameRewriter {
 }
 
 /**
+ * Compact one-line description of a request's `tools[]` for logging: each tool
+ * is rendered as `name` plus a qualifier — `:type` for server/built-in tools
+ * (e.g. `web_search:web_search_20250305`), `:no-schema` when it is missing the
+ * required `input_schema`, or bare for a well-formed user-defined tool.
+ */
+function describeTools(body: Record<string, unknown> | null): string {
+  if (!body) return "(no body)";
+  const tools = body["tools"];
+  if (!Array.isArray(tools) || tools.length === 0) return "(none)";
+  const parts = tools.map((t) => {
+    if (!t || typeof t !== "object" || Array.isArray(t)) return "?";
+    const td = t as Record<string, unknown>;
+    const name = typeof td["name"] === "string" ? td["name"] : "?";
+    const type = td["type"];
+    if (typeof type === "string" && type !== "custom") return `${name}:${type}`;
+    if (!("input_schema" in td)) return `${name}:no-schema`;
+    return name;
+  });
+  return `[${parts.join(", ")}]`;
+}
+
+/** Compact description of `tool_choice`. */
+function describeToolChoice(body: Record<string, unknown> | null): string {
+  if (!body) return "auto";
+  const tc = body["tool_choice"];
+  if (!tc || typeof tc !== "object") return String(tc ?? "auto");
+  const obj = tc as Record<string, unknown>;
+  const type = obj["type"];
+  const name = obj["name"];
+  return typeof name === "string" ? `${type}:${name}` : String(type ?? "auto");
+}
+
+/**
  * Copy upstream response headers for forwarding to the client, dropping the
  * hop-by-hop/framing headers we manage ourselves (content-length is dropped
  * because the body may be rewritten before it is sent, which would desync the
@@ -1313,6 +1346,16 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
           console.log(
             `[vsllm-proxy] ${req.method} ${pathname} ${formatThinkingLog(props)}`,
           );
+          // For /v1/messages, log the tool set + tool_choice actually being
+          // sent upstream (post-transform) so tool-call issues (e.g. a missing
+          // WebSearch vs a working WebFetch) are visible at a glance.
+          if (routed.callType === "messages") {
+            console.log(
+              `[vsllm-proxy] upstream-tools model=${String(props.model ?? "?")} ` +
+                `tools=${describeTools(parsedBody)} ` +
+                `tool_choice=${describeToolChoice(parsedBody)}`,
+            );
+          }
         } else {
           console.log(
             `[vsllm-proxy] ${req.method} ${pathname} body=non-JSON|empty`,
