@@ -41,6 +41,8 @@ export const OPENCODE_TOOL_NAME_MAP: ReadonlyMap<string, string> = new Map<
   ["lsp", "LSP"],
   ["skill", "Skill"],
   ["question", "AskUserQuestion"],
+  ["list_mcp_resource_templates", "ListMCPResourceTemplates"],
+  ["list_mcp_resources", "ListMCPResources"],
 ]);
 
 /**
@@ -229,10 +231,10 @@ function renameToolUseInMessage(m: unknown): unknown {
  */
 function maybeRenameToolName(value: unknown): string | undefined {
   if (typeof value !== "string" || value === "") return undefined;
-  if (value.startsWith("mcp_")) return undefined;
   const mapped =
     OPENCODE_TOOL_NAME_MAP.get(value) ?? OHMYPI_TOOL_NAME_MAP.get(value);
   if (mapped !== undefined) return mapped;
+  if (value.toLowerCase().includes("mcp")) return undefined;
   return toPascalCase(value);
 }
 

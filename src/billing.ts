@@ -408,8 +408,14 @@ export interface AnthropicBillingResult {
  *                              (default true)
  *   PROXY_CC_DECOY_TOOLS    — append unavailable decoys for any Claude Code
  *                             native tool the request did not supply (anti-ban;
- *                             default false — decoys can interfere with forced
- *                             tool_choice calls such as WebSearch)
+ *                             default true — the full CC native tool set must
+ *                             always be advertised so the tool list matches
+ *                             Claude Code's shape. A supplied tool whose
+ *                             PascalCase name matches a CC name overrides its
+ *                             stub, and a forced `tool_choice` (e.g. WebSearch)
+ *                             still resolves against the retained decoy, so
+ *                             injection is safe to leave on. Set false only to
+ *                             opt out entirely.)
  */
 export function applyAnthropicBilling(
   requestBody: Readonly<Record<string, unknown>>,
@@ -420,7 +426,7 @@ export function applyAnthropicBilling(
   const normalizeTools =
     opts.normalizeTools ?? readEnvFlag("PROXY_CC_NORMALIZE_TOOLS", true);
   const decoyTools =
-    opts.decoyTools ?? readEnvFlag("PROXY_CC_DECOY_TOOLS", false);
+    opts.decoyTools ?? readEnvFlag("PROXY_CC_DECOY_TOOLS", true);
 
   // 1. Strip thinking → scrub → normalize → decoy. Each stage degrades to its
   //    predecessor on failure. Thinking blocks are dropped first because their

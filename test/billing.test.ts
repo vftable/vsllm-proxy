@@ -35,8 +35,9 @@ beforeEach(() => {
     snapshot[k] = process.env[k];
     delete process.env[k];
   }
-  // Decoys default OFF in production now; tests exercise the full pipeline.
-  process.env["PROXY_CC_DECOY_TOOLS"] = "true";
+  // Every knob is cleared so tests run against production defaults. Decoys
+  // default ON — the full CC native tool set is always advertised — so the
+  // suite exercises the real pipeline without force-setting the flag.
 });
 afterEach(() => {
   for (const k of ENV_KEYS) {

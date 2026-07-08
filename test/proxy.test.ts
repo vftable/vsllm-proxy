@@ -1827,8 +1827,10 @@ test("e2e: x-anthropic-billing-header is not sent for non-messages endpoints", a
 });
 
 test("e2e: /v1/messages forwards the CC decoy tools upstream when none are supplied", async () => {
+  // Decoys default ON: the full CC native tool set is always advertised, even
+  // when the client supplies no tools[]. No env override needed.
   const prevDecoys = process.env["PROXY_CC_DECOY_TOOLS"];
-  process.env["PROXY_CC_DECOY_TOOLS"] = "true"; // decoys default OFF in production
+  delete process.env["PROXY_CC_DECOY_TOOLS"];
   let captured: any;
   const { proxy, upstream } = await boot({
     upstreamHandler: async (req, res) => {
