@@ -41,8 +41,8 @@ export const OPENCODE_TOOL_NAME_MAP: ReadonlyMap<string, string> = new Map<
   ["lsp", "LSP"],
   ["skill", "Skill"],
   ["question", "AskUserQuestion"],
-  ["list_mcp_resource_templates", "ListMCPResourceTemplates"],
-  ["list_mcp_resources", "ListMCPResources"],
+  ["list_mcp_resource_templates", "ListMcpResourceTemplatesTool"],
+  ["list_mcp_resources", "ListMcpResourcesTool"],
 ]);
 
 /**
