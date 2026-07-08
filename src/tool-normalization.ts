@@ -239,6 +239,7 @@ function maybeRenameToolName(value: unknown): string | undefined {
     return value.startsWith("mcp__") ? undefined : `mcp__${value}`;
   */
 
+  if (value.toLowerCase().startsWith("mcp_")) return undefined; // MCP tools keep their own naming convention
   return toPascalCase(value);
 }
 
