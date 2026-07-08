@@ -779,6 +779,55 @@ test("PROXY_CC_DECOY_TOOLS=false disables decoy injection", () => {
   assert.equal(body.tools, undefined, "no decoys should be injected");
 });
 
+test("a web_search server tool suppresses the WebSearch decoy (no duplicate)", () => {
+  // `web_search` (server) and `WebSearch` (decoy) differ in spelling but have
+  // the same intent; both present confuses the model into calling the
+  // unavailable decoy. Alphanumeric-normalized dedup must collapse them.
+  const { body } = applyAnthropicBilling({
+    system: "You are Claude Code.",
+    messages: [{ role: "user", content: "Hi" }],
+    tools: [
+      {
+        type: "web_search_20250305",
+        name: "web_search",
+      } as unknown as Record<string, unknown>,
+    ],
+  });
+  const tools = body.tools as Array<{ name: string; type?: string }>;
+  // Exactly one web-search-ish tool: the real server tool.
+  const wsLike = tools.filter((t) =>
+    t.name
+      .toLowerCase()
+      .replace(/[^a-z0-9]/g, "")
+      .includes("websearch"),
+  );
+  assert.equal(wsLike.length, 1, `got: ${JSON.stringify(wsLike)}`);
+  assert.equal(wsLike[0]!.name, "web_search");
+  assert.equal(wsLike[0]!.type, "web_search_20250305");
+});
+
+test("a web_fetch server tool suppresses the WebFetch decoy", () => {
+  const { body } = applyAnthropicBilling({
+    system: "You are Claude Code.",
+    messages: [{ role: "user", content: "Hi" }],
+    tools: [
+      {
+        type: "web_fetch_20250305",
+        name: "web_fetch",
+      } as unknown as Record<string, unknown>,
+    ],
+  });
+  const tools = body.tools as Array<{ name: string }>;
+  const wfLike = tools.filter((t) =>
+    t.name
+      .toLowerCase()
+      .replace(/[^a-z0-9]/g, "")
+      .includes("webfetch"),
+  );
+  assert.equal(wfLike.length, 1, `got: ${JSON.stringify(wfLike)}`);
+  assert.equal(wfLike[0]!.name, "web_fetch");
+});
+
 test("applyAnthropicBilling preserves system[] order [billing, identity, scrubbed...]", () => {
   const { body } = applyAnthropicBilling({
     system: "Workspace root folder: /foo",

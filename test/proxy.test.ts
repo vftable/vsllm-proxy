@@ -1887,8 +1887,16 @@ test("e2e: /v1/messages logs the upstream tool set and tool_choice", async () =>
         model: "claude-sonnet-4-6",
         messages: [{ role: "user", content: "hi" }],
         tools: [
-          { name: "webfetch", description: "d", input_schema: { type: "object" } },
-          { name: "websearch", description: "d", input_schema: { type: "object" } },
+          {
+            name: "webfetch",
+            description: "d",
+            input_schema: { type: "object" },
+          },
+          {
+            name: "websearch",
+            description: "d",
+            input_schema: { type: "object" },
+          },
           {
             type: "web_search_20250305",
             name: "web_search",
@@ -1898,7 +1906,10 @@ test("e2e: /v1/messages logs the upstream tool set and tool_choice", async () =>
       },
     });
     const line = logs.find((l) => l.includes("upstream-tools"));
-    assert.ok(line, `expected an upstream-tools log line, got: ${logs.join(" | ")}`);
+    assert.ok(
+      line,
+      `expected an upstream-tools log line, got: ${logs.join(" | ")}`,
+    );
     // Renamed user tools appear bare; server tool appears with its type tag.
     assert.ok(line!.includes("WebFetch"), line);
     assert.ok(line!.includes("WebSearch"), line);

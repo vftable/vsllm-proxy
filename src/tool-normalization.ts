@@ -387,19 +387,29 @@ export function ensureCcDecoyTools(
   const tools = out["tools"];
   const list: unknown[] = Array.isArray(tools) ? tools : [];
 
+  // Match decoys against existing tools by a normalized key (lowercased, with
+  // non-alphanumerics stripped) so that a real tool suppresses its decoy even
+  // when the spelling differs — e.g. a client `web_search` server tool must
+  // suppress the `WebSearch` decoy, otherwise the model is offered both a
+  // working tool and a "currently unavailable" one with the same intent.
   const existing = new Set<string>();
   for (const t of list) {
     if (t && typeof t === "object" && !Array.isArray(t)) {
       const name = (t as Record<string, unknown>)["name"];
-      if (typeof name === "string") existing.add(name.toLowerCase());
+      if (typeof name === "string") existing.add(decoyDedupKey(name));
     }
   }
 
   const decoys = CC_DECOY_TOOLS.filter(
-    (d) => !existing.has(d.name.toLowerCase()),
+    (d) => !existing.has(decoyDedupKey(d.name)),
   ).map((d) => ({ ...d }));
   if (decoys.length === 0) return out;
 
   out["tools"] = [...list, ...decoys];
   return out;
+}
+
+/** Lowercase + strip non-alphanumerics, for fuzzy decoy de-duplication. */
+function decoyDedupKey(name: string): string {
+  return name.toLowerCase().replace(/[^a-z0-9]/g, "");
 }
