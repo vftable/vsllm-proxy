@@ -234,12 +234,10 @@ function maybeRenameToolName(value: unknown): string | undefined {
   const mapped = OPENCODE_TOOL_NAME_MAP.get(value) ?? OHMYPI_TOOL_NAME_MAP.get(value);
   if (mapped !== undefined) return mapped;
 
-  /*
-  if (value.toLowerCase().includes("mcp"))
-    return value.startsWith("mcp__") ? undefined : `mcp__${value}`;
-  */
+  if (value.toLowerCase().includes("mcp")) {
+    return `mcp__${value.replace(/^mcp_{0,2}/i, "")}`;
+  }
 
-  if (value.toLowerCase().startsWith("mcp_")) return undefined; // MCP tools keep their own naming convention
   return toPascalCase(value);
 }
 
