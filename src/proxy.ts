@@ -737,6 +737,7 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
     }
 
     if (sessionId) out["x-claude-code-session-id"] = sessionId;
+    console.log(out);
     return out;
   }
 
@@ -1362,6 +1363,8 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
           );
         }
       }
+
+      console.log(req.headers)
 
       await forward(
         req,
