@@ -800,6 +800,30 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
       `[vsllm-proxy] outbound key=${keyId} ${reqMethod} ${upstreamPath}`,
     );
 
+    let parsedBody: Record<string, unknown> | null = null;
+    try {
+      if (body && body.length) {
+        parsedBody = JSON.parse(body.toString("utf8")) as Record<
+          string,
+          unknown
+        >;
+      }
+    } catch {
+      parsedBody = null;
+    }
+
+    console.log(req.headers);
+    fs.writeFileSync(
+      `/tmp/${Date.now()}.json`,
+      JSON.stringify({
+        req: outHeaders,
+        upstreamPath,
+        body: parsedBody,
+        sessionId,
+        billingHeader,
+      }),
+    );
+
     return new Promise((resolve) => {
       let connectionTimer: ReturnType<typeof setTimeout> | null = null;
       let settled = false;
@@ -1364,20 +1388,6 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
           );
         }
       }
-
-      console.log(req.headers);
-      fs.writeFileSync(
-        `/tmp/${Date.now()}.json`,
-        JSON.stringify(
-          {
-            req: req.headers,
-            upstreamPath,
-            body: parsedBody,
-            sessionId,
-            billingHeader,
-          },
-        ),
-      );
 
       await forward(
         req,
