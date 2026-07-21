@@ -1376,8 +1376,6 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
             sessionId,
             billingHeader,
           },
-          null,
-          2,
         ),
       );
 
