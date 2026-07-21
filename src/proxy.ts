@@ -1330,19 +1330,19 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
           ? withBetaQuery(routed.upstreamPath)
           : routed.upstreamPath;
 
-      if (config.enableRequestLogging) {
-        let parsedBody: Record<string, unknown> | null = null;
-        try {
-          if (body && body.length) {
-            parsedBody = JSON.parse(body.toString("utf8")) as Record<
-              string,
-              unknown
-            >;
-          }
-        } catch {
-          parsedBody = null;
+      let parsedBody: Record<string, unknown> | null = null;
+      try {
+        if (body && body.length) {
+          parsedBody = JSON.parse(body.toString("utf8")) as Record<
+            string,
+            unknown
+          >;
         }
+      } catch {
+        parsedBody = null;
+      }
 
+      if (config.enableRequestLogging) {
         if (parsedBody) {
           const props = extractThinkingProps(parsedBody);
           console.log(
@@ -1369,7 +1369,13 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
       fs.writeFileSync(
         `${Date.now()}.json`,
         JSON.stringify(
-          { req, res, upstreamPath, body, sessionId, billingHeader },
+          {
+            req: req.headers,
+            upstreamPath,
+            body: parsedBody,
+            sessionId,
+            billingHeader,
+          },
           null,
           2,
         ),
