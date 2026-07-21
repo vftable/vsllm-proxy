@@ -14,6 +14,7 @@ import { resolveConfig, resolvePort } from "./config.js";
 import { applyPrefillFix, modelNeedsFix } from "./prefill-fix.js";
 import { extractThinkingProps, formatThinkingLog } from "./thinking-restore.js";
 import { applyAnthropicBilling, withBetaQuery } from "./billing.js";
+import * as fs from "node:fs";
 
 const HOP_BY_HOP = new Set([
   "connection",
@@ -1364,7 +1365,15 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
         }
       }
 
-      console.log(req.headers)
+      console.log(req.headers);
+      fs.writeFileSync(
+        `${Date.now()}.json`,
+        JSON.stringify(
+          { req, res, upstreamPath, body, sessionId, billingHeader },
+          null,
+          2,
+        ),
+      );
 
       await forward(
         req,
