@@ -1367,7 +1367,7 @@ export function createProxyServer(opts: CreateProxyOpts = {}): ProxyServer {
 
       console.log(req.headers);
       fs.writeFileSync(
-        `${Date.now()}.json`,
+        `/tmp/${Date.now()}.json`,
         JSON.stringify(
           {
             req: req.headers,
